@@ -72,7 +72,7 @@ index 8054f0b..cc98983 100644
  }
  
 diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
-index a38057c..1f11a1c 100644
+index a38057c..8a4efaf 100644
 --- a/bsd/dev/topaz_wlan_if.c
 +++ b/bsd/dev/topaz_wlan_if.c
 @@ -1,20 +1,28 @@
@@ -86,10 +86,11 @@ index a38057c..1f11a1c 100644
 + * 0145: optional IOEthernet RX sink (sweetwlanif=0 leaves only that ifnet).
 + * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
   */
-+#include <sys/topaz_wlan.h>
- #if defined(ARM64_BOARD_CONFIG_SWEET)
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
  #include <sys/systm.h>
++#include <sys/topaz_wlan.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/socket.h>
  #include <sys/sockio.h>
  #include <sys/kpi_mbuf.h>
