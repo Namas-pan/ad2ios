@@ -4,6 +4,37 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### Interactive latency outside the display: UFS, touch, radio idle, console ring (0137, 2026-10-22)
+
+The display work (0134) removed the per-frame copy, but four other hot paths
+still cost more than they need once the phone is interactive
+(`xnu/patches/0137-topaz-perf-sweep.patch`):
+
+- **UFS command wait** (`bsd/dev/sweet_ufs.c`, `ufs_scsi()`): after 50 us of
+  spinning the thread napped a flat `CMD_SLEEP_NS` (200 us) per poll, so a
+  4 KiB read that the device answered in ~100 us still waited up to 200 us —
+  and an app launch issues thousands of those. The interval now starts at
+  `CMD_SLEEP_MIN_NS` (20 us) and doubles up to `CMD_SLEEP_NS`, so fast commands
+  are picked up quickly and slow ones still sleep instead of spinning.
+- **Touch cadence** (`bsd/dev/sweet_touch.c`): the poll loop slept 10 ms
+  unconditionally — 100 wakeups/s on a four-core phone, and 10 ms of avoidable
+  latency while drawing. It now sleeps 8 ms while a finger is down and 16 ms
+  when idle; the IRQ-hint path's "read anyway" counter went from 10 ticks to 6
+  so idle reads stay at roughly 100 ms.
+- **Radio idle cadence**: `a_poll_idle_ms` (0135) defaults to 8 ms instead of
+  4 ms, halving the steady wakeup load once the link has been quiet for
+  150 ms. The 1 ms datapath cadence while traffic flows is unchanged, and
+  `topazpoll=` still overrides it.
+- **Console ring** (`sweet_log_append()` / `sweet_log_copy()`): both did one
+  64-bit modulo per byte over the 4 MiB ring, and the append path runs for
+  every kernel `printf` and every `/dev/console` write (boot included). They
+  now compute the offset once and `memcpy` the (possibly wrapped) run.
+
+Status: `git apply --check` clean against the post-0136 tree. CI run/patch
+verification is recorded below once the push completes. No device measurement
+yet — the intended confirmations are a lower idle wakeup rate and snappier
+drawing, neither of which a log line shows.
+
 ### HTT TX ring: free slots on completion (0136, 2026-10-22)
 
 `topaz_wlan_tx()` reused a descriptor slot only when its last use was 50 ms
