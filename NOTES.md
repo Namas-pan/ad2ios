@@ -4,6 +4,31 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### Modem poll cadence: stop spinning at 1 kHz (0135, 2026-10-22)
+
+Nothing in the modem stack is interrupt wired end to end: glink RX, the
+copy-engine (CE) ring, HTT events, association and the `tw0` timers are all
+serviced from `modem_watch()` in `iokit/Kernel/arm/TopazModem.cpp`, which did
+`IOSleep(1)` per iteration. With the default `modem_watch=0` ("serve the modem
+for the whole session") that is 1000 wakeups/s forever on a machine that has
+four usable cores and runs the GUI on the same box — steady scheduler pressure
+and power drain, and a plausible source of interactive jitter once the lock
+screen is up.
+
+`xnu/patches/0135-topaz-poll-cadence.patch` keeps the 1 ms cadence while
+anything moves (`poll_kick()` is called from `rx_one()` for glink messages,
+`htt_rx()`, `assoc_on_rx_msdu()` and `topaz_wlan_tx()`, and stamps
+`poll_kick_ms`), and after `POLL_QUIET_MS` (150) of quiet the loop advances by
+`a_poll_idle_ms` instead of 1 ms. Bring-up is untouched: the back-off only
+starts once `api_ready` is set, so firmware download, scan and association all
+still run at 1 ms. `topazpoll=<ms>` sets the idle cadence (default 4, clamped
+to 50; `0` or `1` restores the old always-1 ms behaviour).
+
+Status: verified to apply by `git apply --check` against the post-0134 tree;
+compiles in CI (see the run for the commit that adds it). No device measurement
+yet — the intended confirmation is CPU idle/residency on the phone, not a log
+line.
+
 ### Display path: dirty rectangles + measured present rate (0134, 2026-10-22)
 
 The panel is refreshed by a CPU `memcpy` out of the back buffer on every vsync
@@ -29,9 +54,9 @@ system needs. Cutting it from ~1 GB/s of copying to a status-bar-sized box is
 the single largest CPU win available in software; nothing here changes the
 image content, only how much of it is copied.
 
-Status: compiles in CI (run 39735442933 was green before this patch; the run
-that includes 0134 confirms the build). No device measurement yet — the
-`SWEET FB: present … us` log line reports the measured cost once it boots.
+Status: compiles in CI (run 39736844471, commit de72c43, green with 0134 in the
+chain). No device measurement yet — the `SWEET FB: present … us` log line
+reports the measured cost once it boots.
 
 ### Host unit tests (WPA2 crypto, IPv4/DHCP helpers) (2026-10-22)
 

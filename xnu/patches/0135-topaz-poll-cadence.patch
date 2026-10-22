@@ -1,0 +1,105 @@
+Subject: [PATCH] topaz: adaptive poll cadence for the modem datapath
+
+The modem thread polls - nothing is interrupt wired end to end: glink RX, the
+copy-engine ring, HTT, association and the tw0 timers are all serviced from
+modem_watch()'s loop, which slept 1 ms per iteration with the default
+modem_watch=0, i.e. 1000 wakeups per second for the whole session. On a phone
+that has four usable cores and runs the GUI on the same box that is steady
+scheduler pressure and power drain, and it shows up as interactive jitter.
+
+The loop keeps the 1 ms cadence while anything moves (a glink message, an HTT
+event, a received MSDU or one of our own transmits sets poll_kick_ms) and backs
+off to a_poll_idle_ms after POLL_QUIET_MS of quiet. Bring-up keeps step 1
+because the back-off only starts once api_ready is set. topazpoll=<ms> picks
+the idle cadence (default 4; 0 or 1 keeps the old 1 ms behaviour).
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7681f53..58be2f5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -479,6 +479,18 @@ static bool q_hello_sent, q_hello_rx, q_announced;
+ static struct { uint32_t svc, inst, node, port; } q_srv[64];
+ static unsigned q_srv_count, g_rx_msgs, g_tx_msgs, q_resumes;
+ static unsigned g_ms;                           /* watch time, for the log */
++/*
++ * Polled datapath cadence. The whole glink/WLAN stack is driven from
++ * modem_watch()'s loop; it has to poll (nothing is interrupt wired end to end),
++ * but 1000 wakeups/s for the rest of the session starve the other cores that run
++ * the GUI and cost power. Poll at 1 ms while anything moves and back off to
++ * a_poll_idle_ms once the link has been quiet for POLL_QUIET_MS.
++ * topazpoll=<ms> overrides the idle cadence (0 or 1 disables the back-off).
++ */
++#define POLL_QUIET_MS 150
++static unsigned a_poll_idle_ms = 4;
++static unsigned poll_kick_ms;
++static inline void poll_kick(void) { poll_kick_ms = g_ms; }
+ 
+ static uint32_t
+ rx_avail(void)
+@@ -780,6 +792,7 @@ qrtr_rx(const uint8_t *p, uint32_t len)
+ static bool
+ rx_one(void)
+ {
++	poll_kick();
+ 	struct glink_msg m;
+ 	uint32_t avail = rx_avail(), n;
+ 
+@@ -4400,6 +4413,7 @@ htt_start(void)
+ static void
+ htt_rx(const uint8_t *p, uint32_t len)
+ {
++	poll_kick();
+ 	uint8_t type = len != 0 ? p[0] : 0xFF;
+ 	htt_msgs++;
+ 	if (type == T2H_VERSION_CONF && len >= 3) {
+@@ -5322,6 +5336,7 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+ static void
+ assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
+ {
++	poll_kick();
+ 	unsigned hdr, llc, ethertype, pay;
+ 	uint8_t type, subtype, ds;
+ 	static uint32_t data_rx;
+@@ -5508,6 +5523,7 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+ 		return false;
+ 	}
+ 	htt_tx_sent++;
++	poll_kick();
+ 	if (htt_tx_sent <= 8) {
+ 		LOG("t=%u ms: htt tx id %u len %u%s", g_ms, id, len,
+ 		    eapol ? " EAPOL" : "");
+@@ -5787,7 +5803,8 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+ 	bool glink = false;
+-	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ms++) {
++	for (unsigned ms = 0; seconds == 0 || ms < seconds * 1000; ) {
++		unsigned step = 1;
+ 		if (ready && !glink) {
+ 			glink = glink_start(part);
+ 			if (!glink) {
+@@ -5848,7 +5865,12 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 			}
+ 			ipa_last = v;
+ 		}
+-		IOSleep(1);
++		if (a_poll_idle_ms > 1 && api_ready &&
++		    (ms - poll_kick_ms) > POLL_QUIET_MS) {
++			step = a_poll_idle_ms;
++		}
++		ms += step;
++		IOSleep(step);
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
+ 	if (glink) {
+@@ -6016,6 +6038,10 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	unsigned watch = 0;                         /* 0: serve the modem for the whole session */
+ 
+ 	(void)PE_parse_boot_argn("modem_watch", &watch, sizeof(watch));
++	unsigned pollarg = a_poll_idle_ms;
++	if (PE_parse_boot_argn("topazpoll", &pollarg, sizeof(pollarg))) {
++		a_poll_idle_ms = pollarg > 50 ? 50 : pollarg;
++	}
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
+ 	/* sweet_ufs comes up with the root device; the modem is not needed before that */
+ 	{
