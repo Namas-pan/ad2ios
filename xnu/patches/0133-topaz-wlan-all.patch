@@ -10,11 +10,72 @@ index 57c93fa..2484260 100644
  bsd/dev/sweet_cpufreq.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
+diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
+index 8054f0b..cc98983 100644
+--- a/bsd/dev/sweet_rtc.c
++++ b/bsd/dev/sweet_rtc.c
+@@ -202,28 +202,41 @@ rtc_alarm_set_enable(bool on)
+ 	return rc;
+ }
+ 
++static int
++rtc_read_raw_word(uint32_t *secs)
++{
++	uint8_t b[4];
++
++	if (rtc_spmi_read(RTC_READ + 0, &b[0]) ||
++	    rtc_spmi_read(RTC_READ + 1, &b[1]) ||
++	    rtc_spmi_read(RTC_READ + 2, &b[2]) ||
++	    rtc_spmi_read(RTC_READ + 3, &b[3])) {
++		return -1;
++	}
++	*secs = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
++	    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++	return 0;
++}
++
++/*
++ * The counter is fetched one byte at a time over SPMI, so a carry that lands
++ * between two byte reads tears the word (e.g. 0x00ff01 -> 0x00ff02 read as
++ * 0x00ff01 and 0x000002). Two matching full reads prove the sample stable;
++ * on a mismatch a third read is taken because a byte-level comparison of the
++ * low byte (the old check) misses carries into b1..b3 entirely.
++ */
+ static int
+ rtc_read_raw(uint32_t *secs)
+ {
+-	uint8_t b0, b1, b2, b3, b0b;
++	uint32_t first = 0, second = 0;
+ 
+-	if (rtc_spmi_read(RTC_READ + 0, &b0) ||
+-	    rtc_spmi_read(RTC_READ + 1, &b1) ||
+-	    rtc_spmi_read(RTC_READ + 2, &b2) ||
+-	    rtc_spmi_read(RTC_READ + 3, &b3) ||
+-	    rtc_spmi_read(RTC_READ + 0, &b0b)) {
++	if (rtc_read_raw_word(&first) || rtc_read_raw_word(&second)) {
+ 		return -1;
+ 	}
+-	if (b0b < b0) {
+-		if (rtc_spmi_read(RTC_READ + 0, &b0) ||
+-		    rtc_spmi_read(RTC_READ + 1, &b1) ||
+-		    rtc_spmi_read(RTC_READ + 2, &b2) ||
+-		    rtc_spmi_read(RTC_READ + 3, &b3)) {
+-			return -1;
+-		}
++	if (first != second && rtc_read_raw_word(&second)) {
++		return -1;
+ 	}
+-	*secs = (uint32_t)b0 | ((uint32_t)b1 << 8) |
+-	    ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
++	*secs = second;
+ 	return 0;
+ }
+ 
 diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
-index a38057c..7297394 100644
+index a38057c..1f11a1c 100644
 --- a/bsd/dev/topaz_wlan_if.c
 +++ b/bsd/dev/topaz_wlan_if.c
-@@ -1,6 +1,10 @@
+@@ -1,20 +1,28 @@
  /*
 - * topaz: attach ifnet tw0 when TopazModem WLAN radio is ready (0126 API).
 - * Stub only — no assoc / datapath. Output frees mbufs. sweetwlanif=0 skips.
@@ -25,17 +86,18 @@ index a38057c..7297394 100644
 + * 0145: optional IOEthernet RX sink (sweetwlanif=0 leaves only that ifnet).
 + * sweetwlanif=0 skips. wifigarpon=0 disables GARP.
   */
++#include <sys/topaz_wlan.h>
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -8,6 +12,7 @@
+ #include <sys/systm.h>
  #include <sys/socket.h>
  #include <sys/sockio.h>
  #include <sys/kpi_mbuf.h>
+-#include <sys/topaz_wlan.h>
 +#include <sys/kpi_socket.h>
- #include <sys/topaz_wlan.h>
  #include <net/ethernet.h>
  #include <net/if.h>
-@@ -15,6 +20,9 @@
+ #include <net/if_types.h>
  #include <net/if_ether.h>
  #include <net/ether_if_module.h>
  #include <net/kpi_interface.h>
@@ -45,7 +107,7 @@ index a38057c..7297394 100644
  #include <pexpert/pexpert.h>
  #include <kern/locks.h>
  
-@@ -23,15 +31,647 @@ static lck_mtx_t *tw_lock;
+@@ -23,15 +31,643 @@ static lck_mtx_t *tw_lock;
  static int tw_enabled = 1;
  static bool tw_hooked;
  static bool tw_attached;
@@ -71,6 +133,8 @@ index a38057c..7297394 100644
 +static uint32_t tw_dhcp_lease_sec; /* option 51; 0 = unknown */
 +static uint32_t tw_dhcp_t1_ms;     /* renew deadline (g_ms); 0 = none */
 +static unsigned tw_dhcp_tries;
++static uint32_t tw_dhcp_restart_ms; /* retry after a failed discover; 0 = none */
++static uint32_t tw_tx_drops, tw_rx_drops;
 +
 +#define DHCPDISCOVER    1
 +#define DHCPOFFER       2
@@ -89,15 +153,6 @@ index a38057c..7297394 100644
 +#define DHCP_DEFAULT_LEASE_SEC 3600
 +
 +static void tw_dhcp_start(uint32_t ms);
-+static topaz_wlan_enet_rx_fn tw_enet_rx;
-+static void *tw_enet_rx_arg;
-+
-+void
-+topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg)
-+{
-+	tw_enet_rx = fn;
-+	tw_enet_rx_arg = arg;
-+}
 +
 +static int
 +tw_parse_ipv4(const char *s, uint32_t *host_order)
@@ -570,7 +625,7 @@ index a38057c..7297394 100644
 +	}
 +	if (msg == DHCPNAK && (tw_dhcp_state == TW_DHCP_REQUEST ||
 +	    tw_dhcp_state == TW_DHCP_RENEW)) {
-+		printf("SWEET WLAN: DHCP NAK — restarting DISCOVER\n");
++		printf("SWEET WLAN: DHCP NAK, restarting DISCOVER\n");
 +		tw_dhcp_t1_ms = 0;
 +		tw_dhcp_state = TW_DHCP_IDLE;
 +		tw_addr_done = false;
@@ -677,17 +732,20 @@ index a38057c..7297394 100644
 +	}
 +	len = mbuf_pkthdr_len(m);
 +	if (len < ETHER_HDR_LEN || len > sizeof(buf)) {
++		tw_tx_drops++;
  		ifnet_stat_increment_out(ifp, 0, 0, 1);
  		mbuf_freem(m);
 +		return 0;
  	}
 +	if (mbuf_copydata(m, 0, len, buf) != 0) {
++		tw_tx_drops++;
 +		ifnet_stat_increment_out(ifp, 0, 0, 1);
 +		mbuf_freem(m);
 +		return 0;
 +	}
 +	mbuf_freem(m);
 +	if (!topaz_wlan_authorized() || !topaz_wlan_tx_ethernet(buf, (unsigned)len)) {
++		tw_tx_drops++;
 +		ifnet_stat_increment_out(ifp, 0, 0, 1);
 +		return 0;
 +	}
@@ -695,7 +753,7 @@ index a38057c..7297394 100644
  	return 0;
  }
  
-@@ -40,9 +680,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
+@@ -40,9 +676,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
  {
  	switch (cmd) {
  	case SIOCSIFADDR:
@@ -709,7 +767,7 @@ index a38057c..7297394 100644
  	default:
  		return EOPNOTSUPP;
  	}
-@@ -104,7 +748,7 @@ tw_attach_ifnet(void)
+@@ -104,7 +744,7 @@ tw_attach_ifnet(void)
  	ifnet_set_addrlen(tw_ifp, ETHER_ADDR_LEN);
  	ifnet_set_hdrlen(tw_ifp, sizeof(struct ether_header));
  	ifnet_set_mtu(tw_ifp, ETHERMTU);
@@ -718,7 +776,7 @@ index a38057c..7297394 100644
  	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
  	if (ifnet_attach(tw_ifp, NULL) != 0) {
  		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
-@@ -114,20 +758,169 @@ tw_attach_ifnet(void)
+@@ -114,20 +754,199 @@ tw_attach_ifnet(void)
  	ifnet_set_lladdr(tw_ifp, mac, ETHER_ADDR_LEN);
  	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
  	tw_attached = true;
@@ -746,10 +804,6 @@ index a38057c..7297394 100644
 +	mbuf_t m = NULL;
 +	struct ifnet_stat_increment_param stats;
 +
-+	if (eth != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
-+	    tw_enet_rx != NULL) {
-+		tw_enet_rx(eth, len, tw_enet_rx_arg);
-+	}
 +	if (!tw_attached || tw_ifp == NULL || eth == NULL ||
 +	    len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
 +		return;
@@ -758,9 +812,11 @@ index a38057c..7297394 100644
 +		return;
 +	}
 +	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0 || m == NULL) {
++		tw_rx_drops++;
 +		return;
 +	}
 +	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
++		tw_rx_drops++;
 +		mbuf_freem(m);
 +		return;
 +	}
@@ -799,6 +855,7 @@ index a38057c..7297394 100644
 +	tw_dhcp_t1_ms = 0;
 +	tw_dhcp_last_ms = 0;
 +	tw_dhcp_tries = 0;
++	tw_dhcp_restart_ms = 0;
 +	tw_cfg_ip = tw_cfg_mask = tw_cfg_gw = tw_cfg_dns = 0;
 +	if (!tw_attached || tw_ifp == NULL) {
 +		tw_addr_done = false;
@@ -841,6 +898,21 @@ index a38057c..7297394 100644
 +}
 +
 +void
++topaz_wlan_if_stats(struct topaz_wlan_if_counters *counters)
++{
++	if (counters == NULL) {
++		return;
++	}
++	counters->tx_drops = tw_tx_drops;
++	counters->rx_drops = tw_rx_drops;
++	counters->dhcp_state = (int)tw_dhcp_state;
++	counters->dhcp_tries = tw_dhcp_tries;
++	counters->ip = tw_cfg_ip;
++	counters->mask = tw_cfg_mask;
++	counters->gw = tw_cfg_gw;
++}
++
++void
 +topaz_wlan_if_poll(uint32_t ms)
 +{
 +	uint8_t msg;
@@ -862,6 +934,17 @@ index a38057c..7297394 100644
 +		return;
 +	}
 +
++	/* A failed discover run is retried on a timer, not only on reassoc. */
++	if (tw_dhcp_state == TW_DHCP_IDLE && tw_dhcp_restart_ms != 0 &&
++	    (int32_t)(ms - tw_dhcp_restart_ms) >= 0) {
++		tw_dhcp_restart_ms = 0;
++		if (topaz_wlan_authorized()) {
++			printf("SWEET WLAN: DHCP retry cycle\n");
++			tw_dhcp_start(ms);
++			return;
++		}
++	}
++
 +	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST &&
 +	    tw_dhcp_state != TW_DHCP_RENEW) {
 +		return;
@@ -880,8 +963,13 @@ index a38057c..7297394 100644
 +			    tw_dhcp_lease_sec : DHCP_DEFAULT_LEASE_SEC);
 +			return;
 +		}
-+		printf("SWEET WLAN: DHCP gave up after %u tries\n", tw_dhcp_tries);
++		printf("SWEET WLAN: DHCP gave up after %u tries; retry in 20 s\n",
++		    tw_dhcp_tries);
 +		tw_dhcp_state = TW_DHCP_IDLE;
++		tw_dhcp_tries = 0;
++		/* Without this the interface stayed address-less until a
++		 * reassociation; a flaky DHCP server must not be terminal. */
++		tw_dhcp_restart_ms = ms + 20000;
 +		return;
 +	}
 +	msg = (tw_dhcp_state == TW_DHCP_DISCOVER) ? DHCPDISCOVER : DHCPREQUEST;
@@ -893,7 +981,7 @@ index a38057c..7297394 100644
  void
  topaz_wlan_if_init(void)
  {
-@@ -141,15 +934,39 @@ topaz_wlan_if_init(void)
+@@ -141,15 +960,46 @@ topaz_wlan_if_init(void)
  	}
  	tw_hooked = true;
  	topaz_wlan_ready_hook = tw_on_ready;
@@ -929,18 +1017,25 @@ index a38057c..7297394 100644
 +}
  void
 -topaz_wlan_if_init(void)
-+topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg)
++topaz_wlan_if_stats(struct topaz_wlan_if_counters *counters)
  {
-+	(void)fn;
-+	(void)arg;
++	if (counters != NULL) {
++		counters->tx_drops = 0;
++		counters->rx_drops = 0;
++		counters->dhcp_state = 0;
++		counters->dhcp_tries = 0;
++		counters->ip = 0;
++		counters->mask = 0;
++		counters->gw = 0;
++	}
  }
  #endif
 diff --git a/bsd/dev/topaz_wlan_sysctl.c b/bsd/dev/topaz_wlan_sysctl.c
 new file mode 100644
-index 0000000..003a024
+index 0000000..12329fd
 --- /dev/null
 +++ b/bsd/dev/topaz_wlan_sysctl.c
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,299 @@
 +/*
 + * topaz: sysctl bridge for WLAN scan / BSS list / join (0138).
 + * 0139: kern.topaz_wlan.psk for runtime WPA2-PSK (or boot-arg wifipsk=).
@@ -1184,6 +1279,18 @@ index 0000000..003a024
 +	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
 +}
 +
++static int
++sysctl_tw_counters SYSCTL_HANDLER_ARGS
++{
++	char buf[160];
++	struct topaz_wlan_if_counters c;
++
++	topaz_wlan_if_stats(&c);
++	snprintf(buf, sizeof(buf), "tx_drops=%u rx_drops=%u dhcp=%d tries=%u\n",
++	    c.tx_drops, c.rx_drops, c.dhcp_state, c.dhcp_tries);
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
 +SYSCTL_NODE(_kern, OID_AUTO, topaz_wlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
 +    "topaz WCN3988 WLAN control");
 +
@@ -1223,6 +1330,10 @@ index 0000000..003a024
 +    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
 +    NULL, 0, sysctl_tw_dns, "A", "DHCP DNS (dotted quad) or empty");
 +
++SYSCTL_PROC(_kern_topaz_wlan, OID_AUTO, counters,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_tw_counters, "A", "tw0 datapath drop counters + DHCP");
++
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
 index d3cf5cc..687d344 100644
@@ -1239,7 +1350,7 @@ index d3cf5cc..687d344 100644
  
  # /usr/include
 diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
-index 2e1e555..75a619f 100644
+index 2e1e555..ecbdc8b 100644
 --- a/bsd/sys/topaz_wlan.h
 +++ b/bsd/sys/topaz_wlan.h
 @@ -2,7 +2,7 @@
@@ -1251,7 +1362,7 @@ index 2e1e555..75a619f 100644
   */
  #ifndef _BSD_SYS_TOPAZ_WLAN_H_
  #define _BSD_SYS_TOPAZ_WLAN_H_
-@@ -31,15 +31,28 @@ bool topaz_wlan_ready(void);
+@@ -31,15 +31,33 @@ bool topaz_wlan_ready(void);
  int topaz_wlan_scan(void);                          /* 0 ok, ENXIO/ETIMEDOUT */
  bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
  void topaz_wlan_address(uint8_t address[6]);
@@ -1262,10 +1373,10 @@ index 2e1e555..75a619f 100644
  int topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
      const uint8_t *key, unsigned key_len);          /* cipher 4 = CCMP */
  bool topaz_wlan_tx(const uint8_t *frame, unsigned len); /* native 802.11 via HTT */
-+bool topaz_wlan_tx_ethernet(const uint8_t *eth, unsigned len); /* eth �?ToDS via HTT */
++bool topaz_wlan_tx_ethernet(const uint8_t *eth, unsigned len); /* eth -> ToDS via HTT */
  
 -/* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
-+/* bsd/dev/topaz_wlan_if.c �?register hook early (before topaz_modem_init). */
++/* bsd/dev/topaz_wlan_if.c register hook early (before topaz_modem_init). */
  void topaz_wlan_if_init(void);
 +void topaz_wlan_if_on_authorized(void); /* apply wifiip= after PTK/open */
 +void topaz_wlan_if_on_disconnected(void); /* clear tw0 IP; allow re-DHCP */
@@ -1273,16 +1384,21 @@ index 2e1e555..75a619f 100644
 +/* Host-order; false if tw0 has no IPv4 yet. dns may be 0. */
 +bool topaz_wlan_if_ipv4(uint32_t *ip, uint32_t *mask, uint32_t *gw,
 +    uint32_t *dns);
-+/* 0145: extra RX sink for IOEthernetInterface (tw0 still receives too). */
-+typedef void (*topaz_wlan_enet_rx_fn)(const uint8_t *eth, unsigned len,
-+    void *arg);
-+void topaz_wlan_enet_set_rx(topaz_wlan_enet_rx_fn fn, void *arg);
-+void topaz_wlan_if_input(const uint8_t *eth, unsigned len); /* HTT RX �?tw0 */
++/* tw0 datapath counters, for sysctl and bring-up logs. */
++struct topaz_wlan_if_counters {
++	uint32_t tx_drops;
++	uint32_t rx_drops;
++	int dhcp_state;                     /* 0 idle, 1 discover, ... */
++	uint32_t dhcp_tries;
++	uint32_t ip, mask, gw;              /* host order; 0 when unset */
++};
++void topaz_wlan_if_stats(struct topaz_wlan_if_counters *counters);
++void topaz_wlan_if_input(const uint8_t *eth, unsigned len); /* HTT RX -> tw0 */
  
  #ifdef __cplusplus
  }
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index d2f41ce..d6345d8 100644
+index d2f41ce..cc137db 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -23,6 +23,7 @@
@@ -1301,7 +1417,12 @@ index d2f41ce..d6345d8 100644
  
  #define CMD_VDEV_START      0x5003
  #define CMD_VDEV_UP         0x5005
-@@ -4645,6 +4647,27 @@ static bool a_auto_tried;
+@@ -4642,9 +4644,32 @@ static bool a_ptk;
+ static char a_boot_ssid[33];
+ static bool a_boot_ssid_set;
+ static bool a_auto_tried;
++static uint32_t a_auto_next_ms;      /* earliest g_ms for the next auto join */
++static uint32_t a_auto_tries;        /* auto join attempts so far */
  static char a_boot_psk[64];
  static bool a_boot_psk_set;
  
@@ -1329,7 +1450,7 @@ index d2f41ce..d6345d8 100644
  static uint8_t *
  a_pmac(uint8_t *p, const uint8_t *mac)
  {
-@@ -4905,11 +4928,17 @@ a_build_assoc_req(uint8_t *f, uint32_t max)
+@@ -4905,11 +4930,17 @@ a_build_assoc_req(uint8_t *f, uint32_t max)
  
  static void a_teardown(void);
  static void a_fail(int status);
@@ -1347,7 +1468,7 @@ index d2f41ce..d6345d8 100644
  	if (a_state >= A_START) {
  		if (a_state == A_UP) {
  			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
-@@ -4923,6 +4952,9 @@ a_teardown(void)
+@@ -4923,6 +4954,9 @@ a_teardown(void)
  	a_up = false;
  	a_ptk = false;
  	topaz_wlan_wpa_reset();
@@ -1357,7 +1478,7 @@ index d2f41ce..d6345d8 100644
  }
  
  static void
-@@ -4973,9 +5005,9 @@ a_begin(void)
+@@ -4973,9 +5007,9 @@ a_begin(void)
  	}
  	a_areq_len = a_aresp_len = 0;
  	a_start_resp = false;
@@ -1369,7 +1490,7 @@ index d2f41ce..d6345d8 100644
  	a_ps_off();
  	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
  		a_fail(-2);
-@@ -4984,6 +5016,7 @@ a_begin(void)
+@@ -4984,6 +5018,7 @@ a_begin(void)
  	a_state = A_START;
  	a_deadline = g_ms + 1500;
  }
@@ -1377,7 +1498,7 @@ index d2f41ce..d6345d8 100644
  static void a_on_up(void)
  {
  	uint8_t rates[16];
-@@ -5002,6 +5035,7 @@ static void a_on_up(void)
+@@ -5002,6 +5037,7 @@ static void a_on_up(void)
  	if (!a_rsn) {
  		a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
  		a_ptk = true;
@@ -1385,7 +1506,45 @@ index d2f41ce..d6345d8 100644
  	}
  	a_state = A_UP;
  	a_up = true;
-@@ -5273,47 +5307,103 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+@@ -5113,10 +5149,20 @@ assoc_try_auto(void)
+ {
+ 	uint32_t i;
+ 
+-	if (!a_boot_ssid_set || a_auto_tried || a_state != A_IDLE) {
++	if (!a_boot_ssid_set || a_state != A_IDLE) {
++		return;
++	}
++	/*
++	 * One join attempt per boot is not enough: a single missed beacon or a
++	 * wrong PSK used to leave the interface down until reboot. Retry after a
++	 * scan, backing off 8/16/24/32 s and then every 40 s.
++	 */
++	if (a_auto_tried && g_ms < a_auto_next_ms) {
+ 		return;
+ 	}
+ 	a_auto_tried = true;
++	a_auto_tries++;
++	a_auto_next_ms = g_ms + (a_auto_tries < 5 ? 8000u * a_auto_tries : 40000u);
+ 	for (i = 0; i < nbss; i++) {
+ 		const struct bss *b = &bss[i];
+ 		uint32_t slen = b->raw_ssid_len ? b->raw_ssid_len :
+@@ -5133,10 +5179,13 @@ assoc_try_auto(void)
+ 			    g_ms, a_boot_ssid);
+ 		}
+ 		assoc_fill_from_bss(b);
+-		LOG("t=%u ms: assoc: wifissid match '%s' queued", g_ms, a_boot_ssid);
++		LOG("t=%u ms: assoc: wifissid match '%s' queued (attempt %u)",
++		    g_ms, a_boot_ssid, a_auto_tries);
+ 		return;
+ 	}
+-	LOG("t=%u ms: assoc: wifissid='%s' not heard (open)", g_ms, a_boot_ssid);
++	LOG("t=%u ms: assoc: wifissid='%s' not heard (attempt %u, next in %u ms)",
++	    g_ms, a_boot_ssid, a_auto_tries,
++	    (uint32_t)(a_auto_next_ms - g_ms));
+ }
+ 
+ static uint32_t a_last_scans;
+@@ -5273,47 +5322,103 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
  static void
  assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
  {
@@ -1396,10 +1555,8 @@ index d2f41ce..d6345d8 100644
 +	static uint32_t data_rx;
 +
 +	if (frame == NULL || len < 24) {
- 		return;
- 	}
--	LOG("t=%u ms: assoc: EAPOL rx %u B", g_ms, len);
--	if (!topaz_wlan_wpa_active()) {
++		return;
++	}
 +	type = frame[0] & 0x0C;
 +	subtype = (uint8_t)(frame[0] >> 4);
 +	if (type != 0x08) {
@@ -1414,6 +1571,12 @@ index d2f41ce..d6345d8 100644
 +		hdr += 6; /* Addr4 */
 +	}
 +	if (len < hdr + 8) {
+ 		return;
+ 	}
+-	LOG("t=%u ms: assoc: EAPOL rx %u B", g_ms, len);
+-	if (!topaz_wlan_wpa_active()) {
++	llc = hdr;
++	if (frame[llc] != 0xAA || frame[llc + 1] != 0xAA || frame[llc + 2] != 0x03) {
  		return;
  	}
 -	{
@@ -1438,10 +1601,6 @@ index d2f41ce..d6345d8 100644
 -			if (!topaz_wlan_tx(tx, 32 + (unsigned)rl)) {
 -				LOG("t=%u ms: assoc: EAPOL tx failed", g_ms);
 -			}
-+	llc = hdr;
-+	if (frame[llc] != 0xAA || frame[llc + 1] != 0xAA || frame[llc + 2] != 0x03) {
-+		return;
-+	}
 +	ethertype = ((unsigned)frame[llc + 6] << 8) | frame[llc + 7];
 +	pay = llc + 8;
 +
@@ -1496,7 +1655,7 @@ index d2f41ce..d6345d8 100644
 +		return;
 +	}
 +
-+	/* IP / other ethertypes �?tw0 once authorized (open or PTK). */
++	/* IP / other ethertypes -> tw0 once authorized (open or PTK). */
 +	if (!a_up || !a_ptk || len < pay) {
 +		return;
 +	}
@@ -1522,7 +1681,51 @@ index d2f41ce..d6345d8 100644
  	}
  }
  
-@@ -5382,6 +5472,43 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+@@ -5324,6 +5429,15 @@ assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
+ static uint8_t *htt_tx_pool;
+ static uint64_t htt_tx_pool_pa;
+ static uint32_t htt_tx_next, htt_tx_sent;
++/*
++ * A descriptor slot is only rewired once its last use is older than this; without
++ * TX completion events the firmware may still be reading the payload and the ext
++ * descriptor, and the previous code rewired slot (n % 32) unconditionally, i.e. it
++ * overwrote whatever was in flight every 32 packets.
++ */
++#define HTT_TX_SLOT_AGE_MS 50
++static uint32_t htt_tx_ms[HTT_TX_SLOTS];
++static uint32_t htt_tx_full;
+ 
+ extern "C" bool
+ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+@@ -5344,7 +5458,26 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+ 			return false;
+ 		}
+ 	}
+-	id = htt_tx_next++ % HTT_TX_SLOTS;
++	id = HTT_TX_SLOTS;
++	for (uint32_t i = 0; i < HTT_TX_SLOTS; i++) {
++		uint32_t s = (htt_tx_next + i) % HTT_TX_SLOTS;
++
++		if (htt_tx_ms[s] == 0 ||
++		    (uint32_t)(g_ms - htt_tx_ms[s]) >= HTT_TX_SLOT_AGE_MS) {
++			id = s;
++			break;
++		}
++	}
++	if (id == HTT_TX_SLOTS) {
++		htt_tx_full++;
++		if ((htt_tx_full & 0xFF) == 1) {
++			LOG("t=%u ms: htt tx: no free slot (%u dropped)",
++			    g_ms, htt_tx_full);
++		}
++		return false;
++	}
++	htt_tx_next = (id + 1) % HTT_TX_SLOTS;
++	htt_tx_ms[id] = g_ms != 0 ? g_ms : 1;
+ 	pa = htt_tx_pool_pa + (uint64_t)id * HTT_TX_SLOT_SIZE;
+ 	memcpy(htt_tx_pool + (size_t)id * HTT_TX_SLOT_SIZE, frame, len);
+ 	ext = htt_bank + (size_t)id * HTT_EXT_DESC_SIZE;
+@@ -5382,6 +5515,43 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
  	return true;
  }
  
@@ -1566,7 +1769,7 @@ index d2f41ce..d6345d8 100644
  extern "C" int
  topaz_wlan_connect_bss(unsigned index)
  {
-@@ -5391,7 +5518,6 @@ topaz_wlan_connect_bss(unsigned index)
+@@ -5391,7 +5561,6 @@ topaz_wlan_connect_bss(unsigned index)
  	assoc_fill_from_bss(&bss[index]);
  	return 0;
  }/* ---------------- the radio for the rest of the kernel (<sys/topaz_wlan.h>) */
@@ -1574,7 +1777,7 @@ index d2f41ce..d6345d8 100644
  
  void (*topaz_wlan_ready_hook)(void);
  
-@@ -5520,6 +5646,7 @@ radio_poll(unsigned ms)
+@@ -5520,6 +5689,7 @@ radio_poll(unsigned ms)
  	(void)ce_poll();
  	htt_poll();
  	assoc_poll();
@@ -1582,351 +1785,6 @@ index d2f41ce..d6345d8 100644
  	if (scan_started && !api_ready) {
  		api_ready = true;
  		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);
-diff --git a/iokit/Kernel/arm/TopazWlan.cpp b/iokit/Kernel/arm/TopazWlan.cpp
-new file mode 100644
-index 0000000..a6d3806
---- /dev/null
-+++ b/iokit/Kernel/arm/TopazWlan.cpp
-@@ -0,0 +1,317 @@
-+/*
-+ * topaz: WCN3988 as IOEthernetController (0145).
-+ * 0140/0142 properties stay. attachInterface() publishes IOEthernetInterface
-+ * so IONetworkStack can attach a BSD ifnet (typically enN).
-+ * Datapath: outputPacket -> topaz_wlan_tx_ethernet; RX via topaz_wlan_enet_set_rx.
-+ * tw0 (0133) still attaches unless sweetwlanif=0. Use sweetwlanif=0 so only
-+ * the IONetwork ifnet carries traffic (in-kernel wifiip=/DHCP then stays off).
-+ * topazwlannub=0 skips. Not IO80211 (wifid still needs that later).
-+ */
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+
-+#include <IOKit/IOLib.h>
-+#include <IOKit/IOTimerEventSource.h>
-+#include <IOKit/network/IOEthernetController.h>
-+#include <IOKit/network/IOEthernetInterface.h>
-+#include <IOKit/network/IONetworkMedium.h>
-+#include <IOKit/network/IOOutputQueue.h>
-+#include <libkern/c++/OSBoolean.h>
-+#include <pexpert/pexpert.h>
-+#include <sys/kpi_mbuf.h>
-+#include <sys/topaz_wlan.h>
-+
-+class TopazWlan : public IOEthernetController {
-+	OSDeclareDefaultStructors(TopazWlan);
-+public:
-+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-+	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
-+	IOReturn getHardwareAddress(IOEthernetAddress *addrP) APPLE_KEXT_OVERRIDE;
-+	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
-+	IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
-+	IOReturn enable(IONetworkInterface *interface) APPLE_KEXT_OVERRIDE;
-+	IOReturn disable(IONetworkInterface *interface) APPLE_KEXT_OVERRIDE;
-+	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
-+	void submitRx(const uint8_t *eth, unsigned len);
-+private:
-+	IOTimerEventSource *fTimer;
-+	bool fTimerAdded;
-+	IONetworkInterface *fIface;
-+	IONetworkMedium *fMedium;
-+	bool fEnabled;
-+	void publish(void);
-+	void updateLink(void);
-+	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
-+};
-+
-+static void
-+topaz_wlan_rx_thunk(const uint8_t *eth, unsigned len, void *arg)
-+{
-+	TopazWlan *self = (TopazWlan *)arg;
-+
-+	if (self != NULL) {
-+		self->submitRx(eth, len);
-+	}
-+}
-+
-+OSDefineMetaClassAndStructors(TopazWlan, IOEthernetController);
-+
-+void
-+TopazWlan::publish(void)
-+{
-+	uint8_t mac[6];
-+	char macstr[32];
-+	char ipstr[16];
-+	uint32_t ip = 0, mask = 0, gw = 0, dns = 0;
-+	bool ready = topaz_wlan_ready();
-+	bool assoc = topaz_wlan_associated();
-+	bool auth = topaz_wlan_authorized();
-+	bool have_ip = topaz_wlan_if_ipv4(&ip, &mask, &gw, &dns);
-+
-+	setProperty("TopazWlanReady", ready ? kOSBooleanTrue : kOSBooleanFalse);
-+	setProperty("TopazWlanAssociated", assoc ? kOSBooleanTrue : kOSBooleanFalse);
-+	setProperty("TopazWlanAuthorized", auth ? kOSBooleanTrue : kOSBooleanFalse);
-+
-+	if (ready) {
-+		topaz_wlan_address(mac);
-+		snprintf(macstr, sizeof(macstr),
-+		    "%02x:%02x:%02x:%02x:%02x:%02x",
-+		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-+		setProperty("TopazWlanMAC", macstr);
-+	}
-+
-+	if (have_ip) {
-+		snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
-+		    (ip >> 24) & 0xff, (ip >> 16) & 0xff,
-+		    (ip >> 8) & 0xff, ip & 0xff);
-+		setProperty("TopazWlanIPv4", ipstr);
-+		snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
-+		    (mask >> 24) & 0xff, (mask >> 16) & 0xff,
-+		    (mask >> 8) & 0xff, mask & 0xff);
-+		setProperty("TopazWlanNetmask", ipstr);
-+		if (gw != 0) {
-+			snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
-+			    (gw >> 24) & 0xff, (gw >> 16) & 0xff,
-+			    (gw >> 8) & 0xff, gw & 0xff);
-+			setProperty("TopazWlanGateway", ipstr);
-+		} else {
-+			removeProperty("TopazWlanGateway");
-+		}
-+		if (dns != 0) {
-+			snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u",
-+			    (dns >> 24) & 0xff, (dns >> 16) & 0xff,
-+			    (dns >> 8) & 0xff, dns & 0xff);
-+			setProperty("TopazWlanDNS", ipstr);
-+		} else {
-+			removeProperty("TopazWlanDNS");
-+		}
-+	} else {
-+		removeProperty("TopazWlanIPv4");
-+		removeProperty("TopazWlanNetmask");
-+		removeProperty("TopazWlanGateway");
-+		removeProperty("TopazWlanDNS");
-+	}
-+}
-+
-+void
-+TopazWlan::updateLink(void)
-+{
-+	UInt32 status = 0;
-+
-+	if (topaz_wlan_authorized()) {
-+		status = kIONetworkLinkValid | kIONetworkLinkActive;
-+	}
-+	setLinkStatus(status, (status != 0) ? fMedium : 0, 433000000ULL);
-+}
-+
-+void
-+TopazWlan::timerFired(OSObject *owner, IOTimerEventSource *sender)
-+{
-+	TopazWlan *self = OSDynamicCast(TopazWlan, owner);
-+
-+	if (self == NULL) {
-+		return;
-+	}
-+	self->publish();
-+	self->updateLink();
-+	if (sender != NULL) {
-+		sender->setTimeoutMS(2000);
-+	}
-+}
-+
-+IOReturn
-+TopazWlan::getHardwareAddress(IOEthernetAddress *addrP)
-+{
-+	if (addrP == NULL) {
-+		return kIOReturnBadArgument;
-+	}
-+	if (!topaz_wlan_ready()) {
-+		bzero(addrP->bytes, kIOEthernetAddressSize);
-+		return kIOReturnNotReady;
-+	}
-+	topaz_wlan_address(addrP->bytes);
-+	return kIOReturnSuccess;
-+}
-+
-+IOReturn
-+TopazWlan::setMulticastMode(bool active)
-+{
-+	(void)active;
-+	return kIOReturnSuccess;
-+}
-+
-+IOReturn
-+TopazWlan::setPromiscuousMode(bool active)
-+{
-+	(void)active;
-+	return kIOReturnSuccess;
-+}
-+
-+IOReturn
-+TopazWlan::enable(IONetworkInterface *interface)
-+{
-+	(void)interface;
-+	fEnabled = true;
-+	updateLink();
-+	return kIOReturnSuccess;
-+}
-+
-+IOReturn
-+TopazWlan::disable(IONetworkInterface *interface)
-+{
-+	(void)interface;
-+	fEnabled = false;
-+	setLinkStatus(0, 0);
-+	return kIOReturnSuccess;
-+}
-+
-+UInt32
-+TopazWlan::outputPacket(mbuf_t m, void *param)
-+{
-+	uint8_t buf[1518];
-+	size_t len;
-+
-+	(void)param;
-+	if (m == NULL) {
-+		return kIOReturnOutputDropped;
-+	}
-+	len = mbuf_pkthdr_len(m);
-+	if (!fEnabled || !topaz_wlan_authorized() ||
-+	    len < kIOEthernetAddressSize * 2 + 2 || len > sizeof(buf) ||
-+	    mbuf_copydata(m, 0, len, buf) != 0 ||
-+	    !topaz_wlan_tx_ethernet(buf, (unsigned)len)) {
-+		freePacket(m);
-+		return kIOReturnOutputDropped;
-+	}
-+	freePacket(m);
-+	return kIOReturnOutputSuccess;
-+}
-+
-+void
-+TopazWlan::submitRx(const uint8_t *eth, unsigned len)
-+{
-+	mbuf_t m;
-+
-+	if (!fEnabled || fIface == NULL || eth == NULL || len < 14 || len > 1518) {
-+		return;
-+	}
-+	m = allocatePacket((UInt32)len);
-+	if (m == NULL) {
-+		return;
-+	}
-+	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
-+		freePacket(m);
-+		return;
-+	}
-+	fIface->inputPacket(m, (UInt32)len, 0, 0);
-+}
-+
-+bool
-+TopazWlan::start(IOService *provider)
-+{
-+	int enabled = 1;
-+	IOWorkLoop *loop;
-+	OSDictionary *media;
-+
-+	(void)PE_parse_boot_argn("topazwlannub", &enabled, sizeof(enabled));
-+	if (!enabled) {
-+		IOLog("TopazWlan: disabled (topazwlannub=0)\n");
-+		return false;
-+	}
-+	if (!IOEthernetController::start(provider)) {
-+		return false;
-+	}
-+
-+	fTimer = NULL;
-+	fTimerAdded = false;
-+	fIface = NULL;
-+	fMedium = NULL;
-+	fEnabled = false;
-+
-+	fMedium = IONetworkMedium::medium(kIOMediumEthernetAuto, 433000000);
-+	media = OSDictionary::withCapacity(1);
-+	if (fMedium == NULL || media == NULL ||
-+	    !IONetworkMedium::addMedium(media, fMedium) ||
-+	    !publishMediumDictionary(media)) {
-+		if (media != NULL) {
-+			media->release();
-+		}
-+		stop(provider);
-+		return false;
-+	}
-+	media->release();
-+	setSelectedMedium(fMedium);
-+
-+	loop = getWorkLoop();
-+	fTimer = IOTimerEventSource::timerEventSource(this, &TopazWlan::timerFired);
-+	if (loop == NULL || fTimer == NULL ||
-+	    loop->addEventSource(fTimer) != kIOReturnSuccess) {
-+		stop(provider);
-+		return false;
-+	}
-+	fTimerAdded = true;
-+
-+	setName("TopazWlan");
-+	if (!attachInterface(&fIface, true) || fIface == NULL) {
-+		IOLog("TopazWlan: attachInterface failed\n");
-+		stop(provider);
-+		return false;
-+	}
-+	topaz_wlan_enet_set_rx(topaz_wlan_rx_thunk, this);
-+	publish();
-+	updateLink();
-+	fTimer->setTimeoutMS(2000);
-+	IOLog("TopazWlan: IOEthernetInterface registered (sweetwlanif=0 to drop tw0)\n");
-+	return true;
-+}
-+
-+void
-+TopazWlan::stop(IOService *provider)
-+{
-+	topaz_wlan_enet_set_rx(NULL, NULL);
-+	if (fTimer != NULL) {
-+		fTimer->cancelTimeout();
-+		if (fTimerAdded) {
-+			IOWorkLoop *loop = getWorkLoop();
-+
-+			if (loop != NULL) {
-+				loop->removeEventSource(fTimer);
-+			}
-+			fTimerAdded = false;
-+		}
-+		fTimer->release();
-+		fTimer = NULL;
-+	}
-+	if (fIface != NULL) {
-+		detachInterface(fIface, true);
-+		fIface = NULL;
-+	}
-+	if (fMedium != NULL) {
-+		fMedium->release();
-+		fMedium = NULL;
-+	}
-+	IOEthernetController::stop(provider);
-+}
-+
-+#else /* !ARM64_BOARD_CONFIG_SWEET */
-+static int topaz_wlan_nub_unused;
-+#endif
-diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 92f3e26..742fefe 100644
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -82,6 +82,17 @@ const char * gIOKernelConfigTables =
-     "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = SweetBattery;"
-     "   },"
-+    "   {"
-+    "     'IOClass'         = TopazWlan;"
-+    "     'IOProviderClass' = IOResources;"
-+    "     'IOMatchCategory' = TopazWlan;"
-+    "   },"
-+    "   {"
-+    "     'IOClass'         = IONetworkStack;"
-+    "     'IOProviderClass' = IOResources;"
-+    "     'IOMatchCategory' = IONetworkStack;"
-+    "     'IOResourceMatch' = IOBSD;"
-+    "   },"
- #endif
-     "   {"
-     "     'IOClass'         = IOPanicPlatform;"
 diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
 index 7613d9b..66e0510 100644
 --- a/iokit/conf/Makefile.template

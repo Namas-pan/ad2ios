@@ -17,18 +17,63 @@ fuzz could not place (the `topaz_wlan_if_on_authorized()` declaration in `bsd/sy
 and its call in the `if (!a_rsn)` assoc path of `iokit/Kernel/arm/TopazModem.cpp`), then letting
 `git diff` regenerate exact context. `git apply --check` passes against the post-`0132` tree.
 
-Contents: `bsd/dev/topaz_wlan_if.c` (HTT Ethernet datapath, RX lock, GARP, DHCP client with reply
-validation, static `wifiip=` config), new `bsd/dev/topaz_wlan_sysctl.c`, `bsd/sys/topaz_wlan.h`
-(+ `topaz_wlan_wpa.h` added to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`), `TopazModem.cpp`
-(assoc/PTK hooks, HTT `T2H 0x07` TX completion), new `iokit/Kernel/arm/TopazWlan.cpp`,
-`iokit/KernelConfigTables.cpp`, `iokit/conf/files.arm64`, `iokit/conf/Makefile.template`,
-`config/MASTER*`.
+Contents (8 files, regenerated 2026-10-22 after the IONetworkingFamily removal):
+`bsd/dev/topaz_wlan_if.c` (HTT Ethernet datapath, RX lock, GARP, DHCP client with reply validation,
+static `wifiip=` config, DHCP retry cycle, drop counters), new `bsd/dev/topaz_wlan_sysctl.c`,
+`bsd/sys/topaz_wlan.h` (+ `topaz_wlan_wpa.h` added to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`),
+`TopazModem.cpp` (assoc/PTK hooks, HTT TX slot ageing), `bsd/dev/sweet_rtc.c` (torn-read fix).
+
+The `IONetworkingFamily` integration (`iokit/Families/IONetworkingFamily/*.cpp`, `TopazWlan.cpp`,
+`iokit/conf/files.arm64`, `iokit/conf/Makefile.template` `SWEET_IONET*`, `options SWEET_IONET`,
+the `TopazWlan` / `IONetworkStack` personalities in `iokit/KernelConfigTables.cpp`) is **gone**:
+those `.cpp` sources are from a newer IOKit than this kernel's headers, and the headers they need
+(`IONetworkController.h`, `IOEthernetController.h`, `IONetworkUserClient.h`, ...) do not exist in
+`xnu-8796` at all. Only the pure-C ifnet `tw0` datapath carries traffic; the `sweetwlanif=` boot
+arg still selects between that path and "nothing" (kept for the boot-arg contract).
 
 Rule going forward: never hand-edit hunk headers again — edit the source tree, re-run the builder
 and regenerate the patch. `xnu.yml`'s "Verify patches applied" step now greps for
 `topaz_wlan_sysctl.c`, `topaz_wlan_if_on_authorized`, `topaz_wlan_wpa.h` in `bsd/sys/Makefile`.
 
-### First green kernel build with the whole WLAN chain (2026-10-22, latest)
+### Datapath hardening batch (2026-10-22, latest)
+
+All of this is inside `xnu/patches/0133-topaz-wlan-all.patch`; nothing else changed. Offline review
+only — no hardware run yet.
+
+- **HTT TX slot reuse (the worst bug).** `topaz_wlan_tx()` used `id = htt_tx_next++ % 32`, i.e. it
+  rewired descriptor slot *n % 32* on every packet while the firmware could still be reading the
+  payload/ext descriptor of the previous occupant. Now a slot is only reused when
+  `g_ms - htt_tx_ms[slot] >= HTT_TX_SLOT_AGE_MS` (50 ms); if every slot is younger, the frame is
+  dropped (counted, logged once per 256) instead of corrupting an in-flight TX. Deliberately chosen
+  over parsing `T2H 0x07 TX_COMPL_IND`: the exact layout of that message is unverified for this
+  firmware, and a mis-parse would either free slots early (same corruption) or never free them
+  (dead TX). Ageing needs no wire-format assumption and cannot dead-lock.
+- **Automatic join retries.** `assoc_try_auto()` had `a_auto_tried` set once per boot, so a single
+  missed beacon or a wrong PSK left `tw0` down until reboot. It now retries after each scan with
+  8/16/24/32 s backoff and then every 40 s (`a_auto_tries`, `a_auto_next_ms`), logging the attempt
+  number.
+- **DHCP retry cycle.** After 12 unanswered tries the client set `TW_DHCP_IDLE` and never tried
+  again until reassociation. It now arms `tw_dhcp_restart_ms = ms + 20000` and `topaz_wlan_if_poll()`
+  restarts the discover cycle while still authorized. The renew-give-up path (keep the address) is
+  unchanged.
+- **RTC torn read.** `rtc_read_raw()` compared only the low byte (`b0b < b0`) after reading b0..b3
+  over SPMI. A carry that lands mid-word while the high bytes have already been read produced a
+  value ~2^24 s or ~1 s off (the RTC counter increments once per second, so the low-byte check also
+  missed carries into b1..b3). Now two full word reads must agree, with a third read on mismatch.
+- **Counters.** `tw_tx_drops`, `tw_rx_drops` plus DHCP state/attempts are readable through the new
+  `_kern.topaz_wlan.counters` sysctl (`topaz_wlan_if_stats()` / `struct topaz_wlan_if_counters`
+  in `bsd/sys/topaz_wlan.h`), so a bring-up log shows whether a failure is TX-side or RX-side
+  without adding printfs to the packet path.
+- **Dead code removed.** `topaz_wlan_enet_set_rx()` and its global sink in `topaz_wlan_if_input()`
+  existed only for the deleted `IOEthernetInterface` datapath. `TopazWlan.cpp` and the
+  `TopazWlan`/`IONetworkStack` personalities are gone with it (`git apply` of the new `0133` leaves
+  `iokit/KernelConfigTables.cpp` exactly as upstream).
+
+Rule kept from last batch: after editing anything under `wlrepo`, regenerate `0133` from a clean
+post-`0132` tree (`git init` + commit base, robocopy the edited tree over it, `git diff --cached`),
+because hand-written hunk headers do not survive `git apply`.
+
+### First green kernel build with the whole WLAN chain (2026-10-22)
 
 CI run **39721267356** (commit `5631e7527b1ad83f1707f92047e171a703985f9c`, job 119635008373) is the
 first build where every topaz patch applies **and** the kernel links:

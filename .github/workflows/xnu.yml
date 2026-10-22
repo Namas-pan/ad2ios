@@ -117,10 +117,11 @@ jobs:
           grep -q 'topaz_wlan_sysctl.c' xnu/bsd/conf/files
           grep -q 'topaz_wlan_set_psk' xnu/iokit/Kernel/arm/TopazModem.cpp
           grep -q 'topaz_wlan_if_on_authorized' xnu/iokit/Kernel/arm/TopazModem.cpp
-          grep -q 'topaz_wlan_enet_set_rx' xnu/bsd/sys/topaz_wlan.h
+          grep -q 'topaz_wlan_if_stats' xnu/bsd/sys/topaz_wlan.h
           grep -q 'topaz_wlan_wpa.h' xnu/bsd/sys/Makefile
           grep -q 'topaz_wlan_tx' xnu/bsd/sys/topaz_wlan.h
           grep -q 'rtrequest' xnu/bsd/dev/topaz_wlan_if.c
+          grep -q 'HTT_TX_SLOT_AGE_MS' xnu/iokit/Kernel/arm/TopazModem.cpp
           echo "WLAN patch (0133 consolidated) is present"
 
       - name: Package build tree for local compiles
