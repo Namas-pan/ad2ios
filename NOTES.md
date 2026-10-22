@@ -21,6 +21,13 @@ the firmware never sends `0x07` nothing changes — the 50 ms age rule stays as
 the fallback, so this cannot make the ring more aggressive than the code it
 replaces.
 
+Status: `git apply --check` clean against the post-0135 tree and green in CI
+(run `39739956721`, commit `7957207`: Build, Verify patches applied, host unit
+tests and the build-tree package all succeeded). No device measurement yet —
+the confirmation is throughput/drop statistics on the phone (`htt tx: no free
+slot` should stop appearing, and the first completion logs
+`htt: TX completions are reported`).
+
 ### Modem poll cadence: stop spinning at 1 kHz (0135, 2026-10-22)
 
 Nothing in the modem stack is interrupt wired end to end: glink RX, the
