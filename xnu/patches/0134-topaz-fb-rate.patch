@@ -1,0 +1,182 @@
+Subject: [PATCH] topaz: cut display cost - dirty rectangles, measured present rate
+
+The panel is refreshed by a CPU memcpy from the back buffer on every vsync,
+so the display path was consuming a full core even when nothing changed:
+
+ - flipBack() cleaned the whole 10 MB back buffer instead of the lines the
+   CPU wrote. AppleCLCD now records the bounding box of every write
+   (markDirty from the swap record path, presents and fades) and cleans only
+   that box; the unmapped console path still cleans everything.
+ - the copy rate was boot-arg fixed (sweetfb_hz, default 10 Hz). It is now
+   measured: presentAccount() keeps a moving average of one present, and the
+   rate follows it (slower above 4 ms per frame, down to 60 Hz again below
+   1.4 ms). sweetfb_adapt=0 restores the fixed rate.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5b16a24..35e729d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -34,6 +34,7 @@
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
++#include <kern/clock.h>
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+@@ -164,6 +165,14 @@ public:
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	/* topaz: part of the back buffer written since the last flip */
++	uint32_t      fDirtyX0, fDirtyY0, fDirtyX1, fDirtyY1;
++	/* topaz: measured cost of one presented frame, used to pick the rate */
++	uint32_t      fPresentUs;
++	uint32_t      fPresentN;
++	bool          fAdapt;
++	void          markDirty(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
++	void          presentAccount(uint64_t delta);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+@@ -373,8 +382,14 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	uint32_t hz = 10;
++	int adapt = 1;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	PE_parse_boot_argn("sweetfb_adapt", &adapt, sizeof(adapt));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fAdapt = adapt != 0;
++	fDirtyX0 = fDirtyY0 = fDirtyX1 = fDirtyY1 = 0;
++	fPresentUs = 0;
++	fPresentN = 0;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -481,7 +496,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
++
+ 		fb->present(rec);
++		fb->presentAccount(mach_absolute_time() - t0);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		IOLockLock(fb->fLock);
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+@@ -781,15 +799,96 @@ AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
+ 			o[x] = lo | (hi << 8);
+ 		}
+ 	}
++	markDirty(0, 0, fWidth, fHeight);
+ 	flipBack();
+ }
+ 
+-/* Clean the back buffer and point the MDP at it (latched at its vsync). */
++/*
++ * topaz: remember which part of the back buffer was written. Presenting used
++ * to clean all 10 MB of it even when only the status bar had changed, and the
++ * MDP only has to see the lines the CPU actually wrote.
++ */
++void
++AppleCLCD::markDirty(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
++	if (x0 >= x1 || y0 >= y1) {
++		return;
++	}
++	if (x1 > fWidth) {
++		x1 = fWidth;
++	}
++	if (y1 > fHeight) {
++		y1 = fHeight;
++	}
++	if (fDirtyX1 <= fDirtyX0 || fDirtyY1 <= fDirtyY0) {
++		fDirtyX0 = x0;
++		fDirtyY0 = y0;
++		fDirtyX1 = x1;
++		fDirtyY1 = y1;
++		return;
++	}
++	if (x0 < fDirtyX0) {
++		fDirtyX0 = x0;
++	}
++	if (y0 < fDirtyY0) {
++		fDirtyY0 = y0;
++	}
++	if (x1 > fDirtyX1) {
++		fDirtyX1 = x1;
++	}
++	if (y1 > fDirtyY1) {
++		fDirtyY1 = y1;
++	}
++}
++
++/*
++ * topaz: moving average of one present plus the panel copy rate that follows
++ * from it. Presenting is a CPU copy, so the rate decides how much of a core
++ * the display takes from the rest of the system: present less often when a
++ * frame costs more than a quarter of the 60 Hz budget, more often when cheap.
++ */
++void
++AppleCLCD::presentAccount(uint64_t delta)
++{
++	uint64_t ns = 0;
++	uint32_t us;
++
++	absolutetime_to_nanoseconds(delta, &ns);
++	us = (uint32_t)(ns / 1000);
++	fPresentUs = fPresentUs == 0 ? us : (fPresentUs * 7 + us) / 8;
++	fPresentN++;
++	if ((fPresentN % 30) == 0 && fAdapt) {
++		if (fPresentUs > 4000 && fFlushTicks < 30) {
++			fFlushTicks++;
++		} else if (fPresentUs < 1400 && fFlushTicks > 1) {
++			fFlushTicks--;
++		}
++	}
++	if ((fPresentN % 300) == 0) {
++		IOLog("SWEET FB: present %u us, showing every %u ticks\n",
++		    fPresentUs, fFlushTicks);
++	}
++}
++
++/* Clean the written part of the back buffer, then point the MDP at it. */
+ void
+ AppleCLCD::flipBack(void)
+ {
+ 	uint32_t idx = fFlipIdx ^ 1;
+-	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
++	uint8_t *base = (uint8_t *)fFlip[idx]->getBytesNoCopy();
++	uint32_t x0 = 0, y0 = 0, x1 = fWidth, y1 = fHeight;
++
++	if (fDirtyX1 > fDirtyX0 && fDirtyY1 > fDirtyY0) {
++		x0 = fDirtyX0;
++		y0 = fDirtyY0;
++		x1 = fDirtyX1;
++		y1 = fDirtyY1;
++	}
++	for (uint32_t y = y0; y < y1; y++) {
++		sweet_dcache_clean((vm_offset_t)(uintptr_t)(base + (uint64_t)y * fRowBytes + (uint64_t)x0 * 4),
++		    (unsigned)((x1 - x0) * 4));
++	}
++	fDirtyX0 = fDirtyY0 = fDirtyX1 = fDirtyY1 = 0;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+ 	fFlipIdx = idx;
+ }
+@@ -805,6 +904,7 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ 			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
+ 		}
+ 	}
++	markDirty(0, 0, fWidth, fHeight);
+ 	flipBack();
+ }
+ 
+@@ -999,6 +1099,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			markDirty((uint32_t)dx, (uint32_t)dy, (uint32_t)(dx + w), (uint32_t)(dy + h));
+ 		}
+ 		s->release();
+ 	}

@@ -4,6 +4,35 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### Display path: dirty rectangles + measured present rate (0134, 2026-10-22)
+
+The panel is refreshed by a CPU `memcpy` out of the back buffer on every vsync
+(`AppleCLCD::present` / `directPresent`), so the display path was paying for a
+full-frame copy on a 60 Hz timer no matter what the GUI changed. Two changes in
+`xnu/patches/0134-topaz-fb-rate.patch` (file `iokit/Kernel/arm/SweetFramebuffer.cpp`):
+
+- `flipBack()` used to `sweet_dcache_clean()` the whole 10 MB back buffer. The
+  class now records the bounding box of every write (`markDirty()`, called from
+  the swap-record present path, the full-frame `directPresent`, and the fade
+  path) and cleans only that box, then resets it. The unmapped console path
+  (`sweet_console_copy_dirty`) still cleans everything, so early boot is
+  unchanged.
+- the panel copy rate was fixed by `sweetfb_hz` (default 10 Hz). It is now
+  measured: `presentAccount()` keeps a moving average of one present and the
+  rate follows it — slower when a frame costs more than 4 ms, back down to
+  60 Hz when it costs less than 1.4 ms. `sweetfb_adapt=0` restores the fixed
+  rate; `sweetfb_hz` still sets the starting point.
+
+Why this matters for "usable after the lock screen": the copy is the only work
+the framebuffer does per frame, and it runs on a Gold core that the rest of the
+system needs. Cutting it from ~1 GB/s of copying to a status-bar-sized box is
+the single largest CPU win available in software; nothing here changes the
+image content, only how much of it is copied.
+
+Status: compiles in CI (run 39735442933 was green before this patch; the run
+that includes 0134 confirms the build). No device measurement yet — the
+`SWEET FB: present … us` log line reports the measured cost once it boots.
+
 ### Host unit tests (WPA2 crypto, IPv4/DHCP helpers) (2026-10-22)
 
 `tools/wpa-unit/` compiles the real `bsd/dev/topaz_wlan_wpa.c` on the host (xnu
