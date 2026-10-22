@@ -25,7 +25,7 @@ diff --git a/bsd/dev/sweet_rtc.c b/bsd/dev/sweet_rtc.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_rtc.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,203 @@
 +/*
 + * topaz: PM6125 RTC (qcom,pm8941-rtc at SPMI 0x6000). Read-only wall clock
 + * for XNU PEGetUTCTimeOfDay / calendar init. SPMI MMIO matches patch 0087
@@ -126,23 +126,25 @@ new file mode 100644
 +rtc_read_raw(uint32_t *secs)
 +{
 +	uint8_t b0, b1, b2, b3, b0b;
-+	int attempt;
 +
-+	for (attempt = 0; attempt < 2; attempt++) {
++	if (rtc_spmi_read(RTC_READ + 0, &b0) ||
++	    rtc_spmi_read(RTC_READ + 1, &b1) ||
++	    rtc_spmi_read(RTC_READ + 2, &b2) ||
++	    rtc_spmi_read(RTC_READ + 3, &b3) ||
++	    rtc_spmi_read(RTC_READ + 0, &b0b)) {
++		return -1;
++	}
++	if (b0b < b0) {
 +		if (rtc_spmi_read(RTC_READ + 0, &b0) ||
 +		    rtc_spmi_read(RTC_READ + 1, &b1) ||
 +		    rtc_spmi_read(RTC_READ + 2, &b2) ||
-+		    rtc_spmi_read(RTC_READ + 3, &b3) ||
-+		    rtc_spmi_read(RTC_READ + 0, &b0b)) {
++		    rtc_spmi_read(RTC_READ + 3, &b3)) {
 +			return -1;
 +		}
-+		if (b0b == b0) {
-+			*secs = (uint32_t)b0 | ((uint32_t)b1 << 8) |
-+			    ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
-+			return 0;
-+		}
 +	}
-+	return -1; /* seconds wrapped between the two LSB reads */
++	*secs = (uint32_t)b0 | ((uint32_t)b1 << 8) |
++	    ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
++	return 0;
 +}
 +
 +int

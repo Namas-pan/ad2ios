@@ -30,21 +30,29 @@ diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 +    const uint8_t *key, unsigned key_len);          /* cipher 4 = CCMP */
 +bool topaz_wlan_tx(const uint8_t *frame, unsigned len); /* native 802.11 via HTT */
  
- /* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
+ /* bsd/dev/topaz_wlan_if.c 鈥?register hook early (before topaz_modem_init). */
  void topaz_wlan_if_init(void);
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -17,6 +17,7 @@ scan_start(void)
+@@ -17,9 +17,11 @@ scan_start(void)
  #define H2T_RX_RING_CFG     2
  #define H2T_AGGR_CFG        5
  #define H2T_FRAG_DESC_BANK_CFG 6
 +#define H2T_TX_FRM          1
  #define T2H_VERSION_CONF    0x00
++#define T2H_TX_COMPL_IND    0x07
  #define T2H_RX_IN_ORD_PADDR_IND 0x12
  #define HTT_RING_SIZE       256
-@@ -42,6 +43,9 @@ static volatile uint32_t *htt_idx;
+ #define HTT_BUF_SIZE        2048
+ #define HTT_MAX_PENDING_TX  (1024 + 32)
+ #define HTT_EXT_DESC_SIZE   72
+@@ -42,10 +43,13 @@ static volatile uint32_t *htt_idx;
  static uint32_t htt_alloc, htt_state, htt_msgs, htt_msdus, htt_req_ms;
+ static volatile uint8_t htt_tx_busy[HTT_TX_SLOTS];
+ 
+ extern "C" void topaz_wlan_tx_lock(void);
+ extern "C" void topaz_wlan_tx_unlock(void);
  
  static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
 +static void assoc_on_rx_msdu(const uint8_t *frame, uint32_t len);

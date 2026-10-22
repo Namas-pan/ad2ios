@@ -18,9 +18,9 @@
 - **0132**: SNonce now comes from `read_random()` instead of MAC/PSK/stack address.
 - **0145**: RX path now takes `fRxLock`, retains `IONetworkInterface` while delivering, serialises `inputPacket()` under that lock, and clears `fIface` under the lock in `stop()`; the lock is deliberately not freed to avoid a modem-thread use-after-free.
 - **0135**: DHCP replies validate IPv4 header checksum, UDP ports 67->68, BOOTREPLY/Ethernet/hlen and chaddr before use.
-- **0127**: `rtc_read_raw()` retries once when the low byte changes and rejects a still-unstable read instead of mixing bytes across a rollover.
 - **0125/0131**: added an HTT TX busy-slot table and `T2H 0x07 TX_COMPL_IND` parsing (status/num_msdus/MSDU-ID array); a slot is only reused after its completion, and a full ring drops instead of overwriting. `MGMT_TX_COMPL_IND` and the odd-num_msdus endian workaround are not implemented.
-- **Still open / not verified**: no kernel compile, no CI run, no phone test. The TX completion layout is taken from the ath10k/WCN3990 HTT documentation, not confirmed on this firmware; configd/IO80211 integration and App Store-class networking remain out of scope.
+- **Deferred**: RTC `rtc_read_raw()` rollover consistency; it was reverted because changing 0127 broke 0128's context and skipped the entire WLAN chain.
+- **Still open / not verified**: no phone test. The TX completion layout is taken from the ath10k/WCN3990 HTT documentation, not confirmed on this firmware; configd/IO80211 integration and App Store-class networking remain out of scope.
 
 ### State (observation from tree, 2026-10-20)
 
