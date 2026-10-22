@@ -28,6 +28,32 @@ Rule going forward: never hand-edit hunk headers again — edit the source tree,
 and regenerate the patch. `xnu.yml`'s "Verify patches applied" step now greps for
 `topaz_wlan_sysctl.c`, `topaz_wlan_if_on_authorized`, `topaz_wlan_wpa.h` in `bsd/sys/Makefile`.
 
+### First green kernel build with the whole WLAN chain (2026-10-22, latest)
+
+CI run **39721267356** (commit `5631e7527b1ad83f1707f92047e171a703985f9c`, job 119635008373) is the
+first build where every topaz patch applies **and** the kernel links:
+
+- Build step: success (7m42s). `dxb/build.sh` skipped only the four pre-existing non-WLAN patches
+  (`TrustCache.patch`, `iobuffermemd_monterey.patch`, `skywalk_sonoma.patch`,
+  `syntax_checker_sonoma.patch`); `0133-topaz-wlan-all.patch` applied cleanly.
+- `Verify patches applied` sentinels: success.
+- Log shows C compiles of `bsd/dev/topaz_wlan_if.c`, `bsd/dev/topaz_wlan_wpa.c`,
+  `bsd/dev/topaz_wlan_sysctl.c` and the C++ compile of `iokit/Kernel/arm/TopazModem.cpp`.
+- Artifacts: `xnu-kernel` id 12401366597 (61.6 MB), `xnu-buildtree` id 12401012762 (22.4 MB).
+- Verified offline: extracted `kernel.development.sweet` (17,834,056 bytes) contains the strings
+  `topaz_wlan_if_input`, `topaz_wlan_tx`, `topaz_wlan_wpa`, `tw0`, `sweetwlanif`, so the datapath
+  code really is in the linked image (not just compiled).
+
+Next concrete actions:
+1. Boot this kernel on topaz (`xnu-kernel.zip` -> `dxb/output` -> `fastboot boot`) and capture the
+   serial console: expect `topaz_wlan: ...` init lines, `tw0` ifnet attach, assoc to the configured
+   SSID, DHCP, and `wifidns=` reporting.
+2. Nothing in the WLAN datapath has ever run on hardware; the first run will show whether the HTT
+   TX ring slots/handshake and the 4-way handshake hooks fire in the right order.
+3. Local git HEAD (`ada4cfc`) and origin/main (`5631e75`) hold the same tree but different SHAs —
+   the push went through the REST API because `github.com:443` is unreachable from this host.
+   Reconcile with `git fetch` + `git reset --hard origin/main` when direct egress works.
+
 ### IONetworkingFamily dropped; 0133 regenerated (2026-10-22, later)
 
 CI run 39719313278 proved the consolidated patch applies but does not compile. Two independent
