@@ -73,6 +73,20 @@ Rule kept from last batch: after editing anything under `wlrepo`, regenerate `01
 post-`0132` tree (`git init` + commit base, robocopy the edited tree over it, `git diff --cached`),
 because hand-written hunk headers do not survive `git apply`.
 
+Result: CI run **39731509290** (commit `86423d8`) **failed** the Build step while
+`Verify patches applied` passed —
+`../../../../../xnu/bsd/sys/topaz_wlan.h:30:1: error: unknown type name 'bool'` (x8): the regenerated
+`topaz_wlan_if.c` included `sys/topaz_wlan.h` before `sys/param.h`/`sys/systm.h`, so `bool` was not
+defined when the prototypes were parsed. `sys/param.h` + `sys/systm.h` now come first and sit
+outside the `ARM64_BOARD_CONFIG_SWEET` guard so the stub branch has them too.
+
+CI run **39732135050** (commit `532f280`) is green: Build success, `Verify patches applied` success,
+`xnu-kernel` artifact id 12406355297 (61,615,623 B). Offline check of
+`kernel.development.sweet` (17,834,448 B): the strings `htt tx: no free slot`,
+`DHCP retry cycle`, `retry in 20 s` and the symbol `topaz_wlan_if_stats` are all present, i.e. this
+batch really is in the linked image. Next concrete action is unchanged: boot this kernel on topaz
+and read the serial log.
+
 ### First green kernel build with the whole WLAN chain (2026-10-22)
 
 CI run **39721267356** (commit `5631e7527b1ad83f1707f92047e171a703985f9c`, job 119635008373) is the
