@@ -122,14 +122,18 @@ jobs:
           grep -q 'topaz_wlan_tx' xnu/bsd/sys/topaz_wlan.h
           grep -q 'rtrequest' xnu/bsd/dev/topaz_wlan_if.c
           grep -q 'HTT_TX_SLOT_AGE_MS' xnu/iokit/Kernel/arm/TopazModem.cpp
+          grep -q 'topaz_wlan_dhcp.h' xnu/bsd/dev/topaz_wlan_if.c
+          test -f xnu/bsd/sys/topaz_wlan_dhcp.h
           echo "WLAN patch (0133 consolidated) is present"
 
-      - name: Host unit tests (WPA2-PSK crypto)
+      - name: Host unit tests (WPA2 crypto, IPv4/DHCP helpers)
         if: always()
         run: |
-          # Compiles the patched bsd/dev/topaz_wlan_wpa.c on the runner and
-          # checks it against FIPS-197 / RFC 2202 / RFC 3394 / IEEE 802.11i
-          # vectors and an independent Python implementation.
+          # Compiles the patched bsd/dev/topaz_wlan_wpa.c and
+          # bsd/sys/topaz_wlan_dhcp.h on the runner and checks them against
+          # FIPS-197 / RFC 2202 / RFC 3394 / IEEE 802.11i vectors and an
+          # independent Python implementation (hashlib/hmac plus an IPv4
+          # checksum written from RFC 1071).
           python3 tools/wpa-unit/run.py --tree dxb/xnu
 
       - name: Package build tree for local compiles

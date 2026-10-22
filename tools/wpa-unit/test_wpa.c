@@ -17,6 +17,8 @@
 #include <stdbool.h>
 
 #include "topaz_wlan_wpa.c"
+/* Pure IPv4/DHCP helpers of the tw0 datapath (bsd/sys/topaz_wlan_dhcp.h). */
+#include <sys/topaz_wlan_dhcp.h>
 
 static void
 dump(const char *name, const uint8_t *p, unsigned n)
@@ -373,6 +375,94 @@ main(void)
 		memcpy(msg3 + (4 + AP_MIC), mic, 16);
 		r = topaz_wlan_wpa_on_eapol(msg3, n3, out, sizeof(out), &keys);
 		printf("gtk_badwrap=%s\n", r < 0 ? "rejected" : "accepted");
+	}
+
+	/* 10. IPv4 / DHCP helpers shared with the tw0 datapath */
+	{
+		static const char *const good[] = {
+			"192.168.1.10", "10.0.0.255", "0.0.0.0", "255.255.255.255"
+		};
+		static const char *const bad[] = {
+			"1..2.3", "1.2.3", "256.1.1.1", "1.2.3.4.5", "1.2.3.a",
+			"", "-1.2.3.4"
+		};
+		uint8_t hdr[20] = {
+			0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x40, 0x00,
+			0x40, 0x06, 0x00, 0x00,
+			0xc0, 0xa8, 0x01, 0x0a,     /* 192.168.1.10 */
+			0xc0, 0xa8, 0x01, 0x01      /* 192.168.1.1 */
+		};
+		static const uint8_t odd[5] = { 0x12, 0x34, 0x56, 0x78, 0x9a };
+		static const uint8_t opts[] = {
+			53, 1, 5,                        /* message type: ACK */
+			1, 4, 255, 255, 255, 0,          /* subnet mask */
+			3, 4, 192, 168, 1, 1,            /* router */
+			54, 4, 192, 168, 1, 1,           /* server id */
+			51, 4, 0, 0, 0x0e, 0x10,         /* lease 3600 */
+			6, 4, 8, 8, 8, 8,                /* DNS */
+			255
+		};
+		static const uint8_t trunc[] = {
+			53, 1, 2, 3, 10, 192, 168, 1, 255
+		};
+		static const uint8_t pads[] = {
+			0, 0, 53, 1, 2, 0, 0, 1, 4, 255, 255, 255, 0, 255
+		};
+		uint8_t msg, b[2];
+		uint32_t ip = 0, mask, gw, server, lease, dns, mask2, gw2;
+		uint16_t c;
+		unsigned i, rejected = 0;
+
+		if (tw_parse_ipv4(good[0], &ip) == 0 && ip == 0xc0a8010a) {
+			printf("ipv4_ok=%08x\n", ip);
+		} else {
+			printf("ipv4_ok=bad\n");
+		}
+		if (tw_parse_ipv4(good[3], &ip) == 0 && ip == 0xffffffff) {
+			printf("ipv4_max=%08x\n", ip);
+		} else {
+			printf("ipv4_max=bad\n");
+		}
+		for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			if (tw_parse_ipv4(bad[i], &ip) != 0) {
+				rejected++;
+			}
+		}
+		printf("ipv4_reject=%u\n", rejected);
+
+		c = tw_ip_cksum(hdr, sizeof(hdr));
+		memcpy(b, &c, sizeof(b));
+		printf("cksum_wire=%02x%02x\n", b[0], b[1]);
+		memcpy(hdr + 10, &c, sizeof(c));
+		printf("cksum_verify=%u\n", tw_ip_cksum(hdr, sizeof(hdr)));
+
+		c = tw_ip_cksum(odd, sizeof(odd));
+		memcpy(b, &c, sizeof(b));
+		printf("cksum_odd=%02x%02x\n", b[0], b[1]);
+
+		mask = 0;
+		gw = 0;
+		server = 0;
+		lease = 0;
+		dns = 0;
+		tw_dhcp_parse_options(opts, sizeof(opts), &msg, &mask, &gw, &server,
+		    &lease, &dns);
+		printf("dhcp_opts=%02x%08x%08x%08x%08x%08x\n", msg, mask, gw,
+		    server, lease, dns);
+
+		msg = 0;
+		mask2 = 0xffffff00;
+		gw2 = 0;
+		tw_dhcp_parse_options(trunc, sizeof(trunc), &msg, &mask2, &gw2,
+		    &server, &lease, &dns);
+		printf("dhcp_trunc=%02x/%08x\n", msg, gw2);
+
+		msg = 0;
+		mask2 = 0;
+		gw2 = 0;
+		tw_dhcp_parse_options(pads, sizeof(pads), &msg, &mask2, &gw2,
+		    &server, &lease, &dns);
+		printf("dhcp_pads=%02x/%08x\n", msg, mask2);
 	}
 
 	return 0;

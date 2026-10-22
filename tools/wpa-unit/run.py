@@ -74,6 +74,18 @@ def ptk(pmk, aa, spa, anonce, snonce):
     return prf_sha1(pmk, b"Pairwise key expansion", m + n, 48)
 
 
+def inet_cksum(data):
+    """One's-complement checksum; returns the big-endian wire value."""
+    if len(data) % 2:
+        data = data + b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
 def expected():
     e = {
         "sha1_abc": SHA1_ABC,
@@ -99,6 +111,21 @@ def expected():
         "gtk_msg4": "ok",
         "gtk_parsed": "ok",
         "gtk_badwrap": "rejected",
+        # IPv4 / DHCP helpers used by the tw0 datapath
+        "ipv4_ok": "c0a8010a",
+        "ipv4_max": "ffffffff",
+        "ipv4_reject": "7",
+        "cksum_wire": "%04x" % inet_cksum(
+            bytes([0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x40, 0x00,
+                   0x40, 0x06, 0x00, 0x00,
+                   0xc0, 0xa8, 0x01, 0x0a, 0xc0, 0xa8, 0x01, 0x01])),
+        "cksum_verify": "0",
+        "cksum_odd": "%04x" % inet_cksum(bytes([0x12, 0x34, 0x56, 0x78,
+                                                0x9a])),
+        "dhcp_opts": "05" + "ffffff00" + "c0a80101" + "c0a80101" +
+                     "00000e10" + "08080808",
+        "dhcp_trunc": "02/00000000",
+        "dhcp_pads": "02/ffffff00",
     }
     return e
 

@@ -4,7 +4,7 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
-### WPA2 host unit tests (2026-10-22)
+### Host unit tests (WPA2 crypto, IPv4/DHCP helpers) (2026-10-22)
 
 `tools/wpa-unit/` compiles the real `bsd/dev/topaz_wlan_wpa.c` on the host (xnu
 header shims in `fake/`, libkern SHA-1 replaced by `sha1_host.c`) and checks it
@@ -21,12 +21,43 @@ against published vectors plus an independent Python implementation:
   body+77), msg3 -> msg4 plus TK install, an all-zero MIC is rejected, an older
   replay counter is rejected. The authenticator-side encoder uses literal
   offsets from the standard, so a layout bug cannot agree with itself.
+- msg3 carrying an RFC 3394 wrapped GTK KDE installs the right GTK/key-id, and a
+  corrupted blob with a valid MIC is refused.
+- The same binary also exercises `bsd/sys/topaz_wlan_dhcp.h`, which is the code
+  the `tw0` datapath runs: `a.b.c.d` parsing (empty fields like `1..2.3` are
+  rejected), the RFC 1071 checksum (compared against a byte-exact Python
+  implementation, including an odd tail byte), and the DHCP option walk
+  (ACK/OFFER, padding bytes, and a length field that overruns the buffer).
 
 Run it with `python tools\wpa-unit\run.py --tree <patched xnu tree>` (MSVC via
 `vcvars64.bat` on Windows, `cc` elsewhere). CI runs the same script as the step
-"Host unit tests (WPA2-PSK crypto)" right after "Verify patches applied".
-Result 2026-10-22: **all 17 checks passed**. This proves the handshake math and
-its wire layout, not the radio path (HTT TX/RX, firmware protocol).
+"Host unit tests (WPA2 crypto, IPv4/DHCP helpers)" after "Verify patches applied".
+Result 2026-10-22: **all 29 checks passed**. This proves the handshake math, its
+wire layout and the DHCP/IPv4 helpers; it does not prove the radio path (HTT
+TX/RX, firmware protocol).
+
+### tw0 datapath: shared DHCP/IPv4 helpers + fixes (2026-10-22)
+
+`bsd/sys/topaz_wlan_dhcp.h` is new. `tw_parse_ipv4()`, `tw_ip_cksum()` and
+`tw_dhcp_parse_options()` moved there as `static inline` with no kernel
+dependencies, so `tools/wpa-unit` tests the exact code the kernel runs instead
+of a copy; `bsd/dev/topaz_wlan_if.c` includes it and lost its local versions.
+
+Fixed while moving them:
+
+- `tw_dhcp_parse_options()` read every 32-bit option with `opt[i] << 24` on a
+  `uint8_t` — a signed-`int` overflow (UB) for any byte >= 0x80, which is most
+  server ids and netmasks. Now `tw_get_be32()` casts to `uint32_t` first.
+- `tw_ip_cksum()` walked the packet as `const uint16_t *`; it reads bytes now,
+  so an odd or unaligned buffer cannot fault.
+- `tw_dhcp_rx()` rejects an IPv4 header shorter than 20 bytes and verifies the
+  header checksum before trusting a reply.
+- `tw_parse_ipv4()` used to accept empty fields (`1..2.3` parsed as 1.0.2.3).
+
+`xnu/patches/0133-topaz-wlan-all.patch` was regenerated the documented way
+(apply it to the post-`0132` tree, edit, `git diff`), re-checked with
+`git apply --check` against a fresh tree, and the CI sentinels now also require
+the new header to be present.
 
 ### Patch chain consolidation (2026-10-22) — read this before touching patches
 

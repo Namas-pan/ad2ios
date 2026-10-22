@@ -72,10 +72,10 @@ index 8054f0b..cc98983 100644
  }
  
 diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
-index a38057c..8a4efaf 100644
+index a38057c..fb2b312 100644
 --- a/bsd/dev/topaz_wlan_if.c
 +++ b/bsd/dev/topaz_wlan_if.c
-@@ -1,20 +1,28 @@
+@@ -1,20 +1,29 @@
  /*
 - * topaz: attach ifnet tw0 when TopazModem WLAN radio is ready (0126 API).
 - * Stub only — no assoc / datapath. Output frees mbufs. sweetwlanif=0 skips.
@@ -90,6 +90,7 @@ index a38057c..8a4efaf 100644
  #include <sys/param.h>
  #include <sys/systm.h>
 +#include <sys/topaz_wlan.h>
++#include <sys/topaz_wlan_dhcp.h>
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/socket.h>
  #include <sys/sockio.h>
@@ -108,7 +109,7 @@ index a38057c..8a4efaf 100644
  #include <pexpert/pexpert.h>
  #include <kern/locks.h>
  
-@@ -23,15 +31,643 @@ static lck_mtx_t *tw_lock;
+@@ -23,15 +32,525 @@ static lck_mtx_t *tw_lock;
  static int tw_enabled = 1;
  static bool tw_hooked;
  static bool tw_attached;
@@ -137,87 +138,10 @@ index a38057c..8a4efaf 100644
 +static uint32_t tw_dhcp_restart_ms; /* retry after a failed discover; 0 = none */
 +static uint32_t tw_tx_drops, tw_rx_drops;
 +
-+#define DHCPDISCOVER    1
-+#define DHCPOFFER       2
-+#define DHCPREQUEST     3
-+#define DHCPACK         5
-+#define DHCPNAK         6
-+#define DHCP_OPT_MSG    53
-+#define DHCP_OPT_REQIP  50
-+#define DHCP_OPT_SERVER 54
-+#define DHCP_OPT_MASK   1
-+#define DHCP_OPT_ROUTER 3
-+#define DHCP_OPT_DNS    6
-+#define DHCP_OPT_LEASE  51
-+#define DHCP_OPT_END    255
 +#define DHCP_RETRANS_MS 3000
 +#define DHCP_DEFAULT_LEASE_SEC 3600
 +
 +static void tw_dhcp_start(uint32_t ms);
-+
-+static int
-+tw_parse_ipv4(const char *s, uint32_t *host_order)
-+{
-+	unsigned a = 0, b = 0, c = 0, d = 0, n = 0, v = 0;
-+	const char *p;
-+
-+	if (s == NULL || s[0] == '\0') {
-+		return -1;
-+	}
-+	for (p = s; ; p++) {
-+		if (*p >= '0' && *p <= '9') {
-+			v = v * 10 + (unsigned)(*p - '0');
-+			if (v > 255) {
-+				return -1;
-+			}
-+			continue;
-+		}
-+		if (*p == '.' || *p == '\0') {
-+			if (n == 0) {
-+				a = v;
-+			} else if (n == 1) {
-+				b = v;
-+			} else if (n == 2) {
-+				c = v;
-+			} else if (n == 3) {
-+				d = v;
-+			} else {
-+				return -1;
-+			}
-+			n++;
-+			v = 0;
-+			if (*p == '\0') {
-+				break;
-+			}
-+			continue;
-+		}
-+		return -1;
-+	}
-+	if (n != 4) {
-+		return -1;
-+	}
-+	*host_order = (a << 24) | (b << 16) | (c << 8) | d;
-+	return 0;
-+}
-+
-+static uint16_t
-+tw_ip_cksum(const void *data, unsigned len)
-+{
-+	const uint16_t *w = (const uint16_t *)data;
-+	uint32_t sum = 0;
-+
-+	while (len > 1) {
-+		sum += ntohs(*w++);
-+		len -= 2;
-+	}
-+	if (len != 0) {
-+		sum += *(const uint8_t *)w << 8;
-+	}
-+	while (sum >> 16) {
-+		sum = (sum & 0xffff) + (sum >> 16);
-+	}
-+	return htons((uint16_t)~sum);
-+}
 +
 +/* Announce SPA=TPA=ip so switches/APs refresh the STA MAC (RFC 5227-ish). */
 +static void
@@ -472,53 +396,6 @@ index a38057c..8a4efaf 100644
 +	    (renew ? "RENEW" : "REQUEST"), tw_dhcp_tries);
 +}
 +
-+static void
-+tw_dhcp_parse_options(const uint8_t *opt, unsigned len, uint8_t *msg,
-+    uint32_t *mask, uint32_t *gw, uint32_t *server, uint32_t *lease,
-+    uint32_t *dns)
-+{
-+	unsigned i = 0;
-+
-+	*msg = 0;
-+	while (i + 1 < len) {
-+		uint8_t code = opt[i++];
-+		uint8_t olen;
-+
-+		if (code == DHCP_OPT_END) {
-+			break;
-+		}
-+		if (code == 0) {
-+			continue;
-+		}
-+		if (i >= len) {
-+			break;
-+		}
-+		olen = opt[i++];
-+		if (i + olen > len) {
-+			break;
-+		}
-+		if (code == DHCP_OPT_MSG && olen >= 1) {
-+			*msg = opt[i];
-+		} else if (code == DHCP_OPT_MASK && olen >= 4) {
-+			*mask = (opt[i] << 24) | (opt[i + 1] << 16) |
-+			    (opt[i + 2] << 8) | opt[i + 3];
-+		} else if (code == DHCP_OPT_ROUTER && olen >= 4) {
-+			*gw = (opt[i] << 24) | (opt[i + 1] << 16) |
-+			    (opt[i + 2] << 8) | opt[i + 3];
-+		} else if (code == DHCP_OPT_SERVER && olen >= 4) {
-+			*server = (opt[i] << 24) | (opt[i + 1] << 16) |
-+			    (opt[i + 2] << 8) | opt[i + 3];
-+		} else if (code == DHCP_OPT_LEASE && olen >= 4) {
-+			*lease = (opt[i] << 24) | (opt[i + 1] << 16) |
-+			    (opt[i + 2] << 8) | opt[i + 3];
-+		} else if (code == DHCP_OPT_DNS && olen >= 4 && dns != NULL) {
-+			*dns = (opt[i] << 24) | (opt[i + 1] << 16) |
-+			    (opt[i + 2] << 8) | opt[i + 3];
-+		}
-+		i += olen;
-+	}
-+}
-+
 +/* Returns true if the frame was a DHCP reply we consumed. */
 +static bool
 +tw_dhcp_rx(const uint8_t *eth, unsigned len)
@@ -544,6 +421,9 @@ index a38057c..8a4efaf 100644
 +		return false;
 +	}
 +	iplen = ((unsigned)ip[0] & 0x0f) * 4;
++	if (iplen < 20) {
++		return false;
++	}
 +	if (len < 14 + iplen + 8) {
 +		return false;
 +	}
@@ -554,6 +434,9 @@ index a38057c..8a4efaf 100644
 +	udplen = ((unsigned)udp[4] << 8) | udp[5];
 +	if (udplen < 8 + 240 || 14 + iplen + udplen > len) {
 +		return false;
++	}
++	if (tw_ip_cksum(ip, iplen) != 0) {
++		return false; /* corrupted IPv4 header */
 +	}
 +	boot = udp + 8;
 +	if (boot[0] != 2) { /* BOOTREPLY */
@@ -734,14 +617,14 @@ index a38057c..8a4efaf 100644
 +	len = mbuf_pkthdr_len(m);
 +	if (len < ETHER_HDR_LEN || len > sizeof(buf)) {
 +		tw_tx_drops++;
- 		ifnet_stat_increment_out(ifp, 0, 0, 1);
- 		mbuf_freem(m);
-+		return 0;
- 	}
-+	if (mbuf_copydata(m, 0, len, buf) != 0) {
-+		tw_tx_drops++;
 +		ifnet_stat_increment_out(ifp, 0, 0, 1);
 +		mbuf_freem(m);
++		return 0;
++	}
++	if (mbuf_copydata(m, 0, len, buf) != 0) {
++		tw_tx_drops++;
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+ 		mbuf_freem(m);
 +		return 0;
 +	}
 +	mbuf_freem(m);
@@ -749,12 +632,12 @@ index a38057c..8a4efaf 100644
 +		tw_tx_drops++;
 +		ifnet_stat_increment_out(ifp, 0, 0, 1);
 +		return 0;
-+	}
+ 	}
 +	ifnet_stat_increment_out(ifp, 1, (int)len, 0);
  	return 0;
  }
  
-@@ -40,9 +676,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
+@@ -40,9 +559,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
  {
  	switch (cmd) {
  	case SIOCSIFADDR:
@@ -768,7 +651,7 @@ index a38057c..8a4efaf 100644
  	default:
  		return EOPNOTSUPP;
  	}
-@@ -104,7 +744,7 @@ tw_attach_ifnet(void)
+@@ -104,7 +627,7 @@ tw_attach_ifnet(void)
  	ifnet_set_addrlen(tw_ifp, ETHER_ADDR_LEN);
  	ifnet_set_hdrlen(tw_ifp, sizeof(struct ether_header));
  	ifnet_set_mtu(tw_ifp, ETHERMTU);
@@ -777,7 +660,7 @@ index a38057c..8a4efaf 100644
  	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
  	if (ifnet_attach(tw_ifp, NULL) != 0) {
  		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
-@@ -114,20 +754,199 @@ tw_attach_ifnet(void)
+@@ -114,20 +637,199 @@ tw_attach_ifnet(void)
  	ifnet_set_lladdr(tw_ifp, mac, ETHER_ADDR_LEN);
  	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
  	tw_attached = true;
@@ -982,7 +865,7 @@ index a38057c..8a4efaf 100644
  void
  topaz_wlan_if_init(void)
  {
-@@ -141,15 +960,46 @@ topaz_wlan_if_init(void)
+@@ -141,15 +843,46 @@ topaz_wlan_if_init(void)
  	}
  	tw_hooked = true;
  	topaz_wlan_ready_hook = tw_on_ready;
@@ -1398,6 +1281,173 @@ index 2e1e555..ecbdc8b 100644
  
  #ifdef __cplusplus
  }
+diff --git a/bsd/sys/topaz_wlan_dhcp.h b/bsd/sys/topaz_wlan_dhcp.h
+new file mode 100644
+index 0000000..1ff0871
+--- /dev/null
++++ b/bsd/sys/topaz_wlan_dhcp.h
+@@ -0,0 +1,161 @@
++/*
++ * topaz: IPv4 / DHCPv4 helpers for the tw0 datapath.
++ *
++ * They deliberately depend only on <sys/types.h> and <string.h>, so
++ * tools/wpa-unit can compile and test the same code the kernel runs instead of
++ * a copy of it.  Nothing here may grow a kernel dependency.
++ */
++#ifndef _SYS_TOPAZ_WLAN_DHCP_H_
++#define _SYS_TOPAZ_WLAN_DHCP_H_
++
++#include <sys/types.h>
++#include <string.h>
++
++#define DHCPDISCOVER	1
++#define DHCPOFFER	2
++#define DHCPREQUEST	3
++#define DHCPACK		5
++#define DHCPNAK		6
++
++#define DHCP_OPT_MSG	53
++#define DHCP_OPT_REQIP	50
++#define DHCP_OPT_SERVER	54
++#define DHCP_OPT_MASK	1
++#define DHCP_OPT_ROUTER	3
++#define DHCP_OPT_DNS	6
++#define DHCP_OPT_LEASE	51
++#define DHCP_OPT_END	255
++
++/* Big-endian 32-bit read from an unaligned byte stream (no signed shifts). */
++static inline uint32_t
++tw_get_be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++	    ((uint32_t)p[2] << 8) | (uint32_t)p[3];
++}
++
++/* "a.b.c.d" -> host order; rejects empty fields, >4 fields and values >255. */
++static inline int
++tw_parse_ipv4(const char *s, uint32_t *host_order)
++{
++	unsigned a = 0, b = 0, c = 0, d = 0, n = 0, v = 0, digits = 0;
++	const char *p;
++
++	if (s == NULL || s[0] == '\0') {
++		return -1;
++	}
++	for (p = s; ; p++) {
++		if (*p >= '0' && *p <= '9') {
++			v = v * 10 + (unsigned)(*p - '0');
++			if (v > 255) {
++				return -1;
++			}
++			digits++;
++			continue;
++		}
++		if (*p == '.' || *p == '\0') {
++			if (digits == 0) {
++				return -1;
++			}
++			if (n == 0) {
++				a = v;
++			} else if (n == 1) {
++				b = v;
++			} else if (n == 2) {
++				c = v;
++			} else if (n == 3) {
++				d = v;
++			} else {
++				return -1;
++			}
++			n++;
++			v = 0;
++			digits = 0;
++			if (*p == '\0') {
++				break;
++			}
++			continue;
++		}
++		return -1;
++	}
++	if (n != 4) {
++		return -1;
++	}
++	*host_order = (a << 24) | (b << 16) | (c << 8) | d;
++	return 0;
++}
++
++/*
++ * One's-complement checksum over a byte stream.  Returns the value to store in
++ * the header (i.e. network byte order); byte-based so endianness never matters.
++ * Verified by zeroing the checksum field of real IPv4/UDP headers.
++ */
++static inline uint16_t
++tw_ip_cksum(const void *data, unsigned len)
++{
++	const uint8_t *p = (const uint8_t *)data;
++	uint32_t sum = 0;
++	uint16_t c;
++
++	while (len > 1) {
++		sum += ((uint32_t)p[0] << 8) | p[1];
++		p += 2;
++		len -= 2;
++	}
++	if (len != 0) {
++		sum += (uint32_t)p[0] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	c = (uint16_t)~sum;
++	return (uint16_t)((c >> 8) | (c << 8));
++}
++
++/*
++ * Walks the DHCP option list (code/len/value, 255 ends, 0 pads) and fills in the
++ * fields tw0 cares about.  Missing options leave the caller's defaults alone.
++ */
++static inline void
++tw_dhcp_parse_options(const uint8_t *opt, unsigned len, uint8_t *msg,
++    uint32_t *mask, uint32_t *gw, uint32_t *server, uint32_t *lease,
++    uint32_t *dns)
++{
++	unsigned i = 0;
++
++	*msg = 0;
++	while (i + 1 < len) {
++		uint8_t code = opt[i++];
++		uint8_t olen;
++
++		if (code == DHCP_OPT_END) {
++			break;
++		}
++		if (code == 0) {
++			continue;
++		}
++		if (i >= len) {
++			break;
++		}
++		olen = opt[i++];
++		if (i + olen > len) {
++			break;
++		}
++		if (code == DHCP_OPT_MSG && olen >= 1) {
++			*msg = opt[i];
++		} else if (code == DHCP_OPT_MASK && olen >= 4) {
++			*mask = tw_get_be32(opt + i);
++		} else if (code == DHCP_OPT_ROUTER && olen >= 4) {
++			*gw = tw_get_be32(opt + i);
++		} else if (code == DHCP_OPT_SERVER && olen >= 4) {
++			*server = tw_get_be32(opt + i);
++		} else if (code == DHCP_OPT_LEASE && olen >= 4) {
++			*lease = tw_get_be32(opt + i);
++		} else if (code == DHCP_OPT_DNS && olen >= 4 && dns != NULL) {
++			*dns = tw_get_be32(opt + i);
++		}
++		i += olen;
++	}
++}
++
++#endif /* _SYS_TOPAZ_WLAN_DHCP_H_ */
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 index d2f41ce..cc137db 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
