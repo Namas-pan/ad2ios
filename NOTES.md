@@ -50,9 +50,11 @@ Next concrete actions:
    SSID, DHCP, and `wifidns=` reporting.
 2. Nothing in the WLAN datapath has ever run on hardware; the first run will show whether the HTT
    TX ring slots/handshake and the 4-way handshake hooks fire in the right order.
-3. Local git HEAD (`ada4cfc`) and origin/main (`5631e75`) hold the same tree but different SHAs —
-   the push went through the REST API because `github.com:443` is unreachable from this host.
-   Reconcile with `git fetch` + `git reset --hard origin/main` when direct egress works.
+3. Egress was repaired on 2026-10-22 by the user (system-wide proxy): plain `git push` to
+   `github.com` works again, so the REST-API fallback (`%TEMP%\ghpush.py`, token in
+   `%TEMP%\gh_tok.txt`) is only needed if the network breaks again. The earlier SHAs written by the
+   API (`ada4cfc`, `5631e75`, `382527f`) never entered local history; local main was reconciled with
+   `git fetch` + `git reset --hard origin/main` and now equals origin (`382527f`).
 
 ### IONetworkingFamily dropped; 0133 regenerated (2026-10-22, later)
 
