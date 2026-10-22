@@ -4,6 +4,30 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### WPA2 host unit tests (2026-10-22)
+
+`tools/wpa-unit/` compiles the real `bsd/dev/topaz_wlan_wpa.c` on the host (xnu
+header shims in `fake/`, libkern SHA-1 replaced by `sha1_host.c`) and checks it
+against published vectors plus an independent Python implementation:
+
+- FIPS-197 AES-128 block encrypt/decrypt, RFC 2202 HMAC-SHA1, RFC 3394 key
+  unwrap (and a corrupted block, which must be rejected), IEEE 802.11i
+  passphrase vector (`password` / `IEEE` -> PMK `f42c6fc5…a12e`).
+- PBKDF2, the 802.11i PRF, PTK derivation and the EAPOL MIC are compared with
+  `hashlib`/`hmac` in `run.py`; PTK derivation must also be invariant under a
+  swapped MAC/nonce order, because the standard sorts them.
+- A synthetic authenticator drives the whole 4-way handshake: msg1 -> msg2
+  (key info `0x010a`, echoed replay counter, SNonce, RSN IE at body+95, MIC at
+  body+77), msg3 -> msg4 plus TK install, an all-zero MIC is rejected, an older
+  replay counter is rejected. The authenticator-side encoder uses literal
+  offsets from the standard, so a layout bug cannot agree with itself.
+
+Run it with `python tools\wpa-unit\run.py --tree <patched xnu tree>` (MSVC via
+`vcvars64.bat` on Windows, `cc` elsewhere). CI runs the same script as the step
+"Host unit tests (WPA2-PSK crypto)" right after "Verify patches applied".
+Result 2026-10-22: **all 17 checks passed**. This proves the handshake math and
+its wire layout, not the radio path (HTT TX/RX, firmware protocol).
+
 ### Patch chain consolidation (2026-10-22) — read this before touching patches
 
 The hand-written series `0133`–`0146` never applied as a chain: each file was authored against a

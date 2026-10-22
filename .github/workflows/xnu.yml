@@ -124,6 +124,14 @@ jobs:
           grep -q 'HTT_TX_SLOT_AGE_MS' xnu/iokit/Kernel/arm/TopazModem.cpp
           echo "WLAN patch (0133 consolidated) is present"
 
+      - name: Host unit tests (WPA2-PSK crypto)
+        if: always()
+        run: |
+          # Compiles the patched bsd/dev/topaz_wlan_wpa.c on the runner and
+          # checks it against FIPS-197 / RFC 2202 / RFC 3394 / IEEE 802.11i
+          # vectors and an independent Python implementation.
+          python3 tools/wpa-unit/run.py --tree dxb/xnu
+
       - name: Package build tree for local compiles
         if: always()
         run: |
