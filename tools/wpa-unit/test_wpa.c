@@ -86,6 +86,38 @@ ap_eapol(uint8_t *out, unsigned max, uint16_t key_info, uint64_t replay,
 	return 4 + body;
 }
 
+/*
+ * RFC 3394 key wrap, written here so the incoming GTK test does not use the
+ * kernel's own (unwrap-only) implementation as both stimulus and oracle.
+ */
+static unsigned
+key_wrap(const uint8_t kek[16], const uint8_t *plain, unsigned plen,
+    uint8_t *out)
+{
+	uint8_t rk[176], blk[16], enc[16];
+	uint8_t a[8] = { 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6 };
+	unsigned n = plen / 8, i, j, t;
+
+	aes_expand(kek, rk);
+	memcpy(out + 8, plain, plen);
+	for (j = 0; j < 6; j++) {
+		for (i = 1; i <= n; i++) {
+			memcpy(blk, a, 8);
+			memcpy(blk + 8, out + 8 * i, 8);
+			aes_encrypt_block(rk, blk, enc);
+			t = n * j + i;
+			memcpy(a, enc, 8);
+			a[4] ^= (uint8_t)(t >> 24);
+			a[5] ^= (uint8_t)(t >> 16);
+			a[6] ^= (uint8_t)(t >> 8);
+			a[7] ^= (uint8_t)t;
+			memcpy(out + 8 * i, enc + 8, 8);
+		}
+	}
+	memcpy(out, a, 8);
+	return plen + 8;
+}
+
 int
 main(void)
 {
@@ -291,6 +323,56 @@ main(void)
 		memcpy(msg + (4 + AP_MIC), mic, 16);
 		r = topaz_wlan_wpa_on_eapol(msg, n, out, sizeof(out), &keys);
 		printf("eapol_replay=%s\n", r < 0 ? "rejected" : "accepted");
+	}
+
+	/* 9. msg3 carrying an encrypted GTK: RFC 3394 unwrap + KDE parse */
+	{
+		uint8_t anonce[32], gtk[16], kd[24], kd_enc[64], zmic[16];
+		uint8_t msg3[256], out[512], mic[16];
+		uint16_t info = (uint16_t)(2 | KI_PAIRWISE | KI_MIC | KI_ACK |
+		    KI_INSTALL | KI_SECURE | KI_ENCRYPTED);
+		struct topaz_wlan_wpa_keys keys;
+		unsigned enclen, i, n3;
+		int r;
+
+		for (i = 0; i < sizeof(anonce); i++) {
+			anonce[i] = (uint8_t)(0xa0 + i);
+		}
+		for (i = 0; i < sizeof(gtk); i++) {
+			gtk[i] = (uint8_t)(0x30 + i);
+		}
+		/* KDE: 0xdd | len 22 | 00 0f ac 01 | key id | reserved | GTK */
+		kd[0] = 0xdd;
+		kd[1] = 22;
+		kd[2] = 0x00;
+		kd[3] = 0x0f;
+		kd[4] = 0xac;
+		kd[5] = 0x01;
+		kd[6] = 0x01;   /* key id 1, TX bit clear */
+		kd[7] = 0x00;
+		memcpy(kd + 8, gtk, sizeof(gtk));
+		enclen = key_wrap(w_kek, kd, sizeof(kd), kd_enc);
+
+		memset(zmic, 0, sizeof(zmic));
+		n3 = ap_eapol(msg3, sizeof(msg3), info, 2, anonce, kd_enc, enclen,
+		    zmic);
+		eapol_mic(w_kck, msg3, n3, mic);
+		memcpy(msg3 + (4 + AP_MIC), mic, 16);
+		r = topaz_wlan_wpa_on_eapol(msg3, n3, out, sizeof(out), &keys);
+		printf("gtk_msg4=%s\n", r == 4 + EAPOL_KEY_BODY ? "ok" : "bad");
+		printf("gtk_parsed=%s\n",
+		    (keys.have_gtk && keys.gtk_len == sizeof(gtk) &&
+		    keys.gtk_id == 1 &&
+		    memcmp(keys.gtk, gtk, sizeof(gtk)) == 0) ? "ok" : "bad");
+
+		/* a corrupted wrapped blob, with a valid MIC, must be refused */
+		kd_enc[1] ^= 0x40;
+		n3 = ap_eapol(msg3, sizeof(msg3), info, 3, anonce, kd_enc, enclen,
+		    zmic);
+		eapol_mic(w_kck, msg3, n3, mic);
+		memcpy(msg3 + (4 + AP_MIC), mic, 16);
+		r = topaz_wlan_wpa_on_eapol(msg3, n3, out, sizeof(out), &keys);
+		printf("gtk_badwrap=%s\n", r < 0 ? "rejected" : "accepted");
 	}
 
 	return 0;

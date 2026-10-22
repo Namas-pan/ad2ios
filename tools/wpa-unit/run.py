@@ -95,6 +95,10 @@ def expected():
         "eapol_msg4": "ok",
         "eapol_badmic": "rejected",
         "eapol_replay": "rejected",
+        # msg3 carrying an RFC 3394 wrapped GTK KDE
+        "gtk_msg4": "ok",
+        "gtk_parsed": "ok",
+        "gtk_badwrap": "rejected",
     }
     return e
 
