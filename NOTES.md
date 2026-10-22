@@ -4,6 +4,23 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### HTT TX ring: free slots on completion (0136, 2026-10-22)
+
+`topaz_wlan_tx()` reused a descriptor slot only when its last use was 50 ms
+old, so the TX ring carried 32 packets per 50 ms (~640 pps) no matter what the
+link allowed and dropped everything faster (the `htt tx: no free slot` log is
+throttled to one line per 256 drops). The firmware does report completions:
+T2H `0x07`, status in bits 0-2, `num_msdus` in bits 8-15, then one 16-bit MSDU
+id per entry — and that id is exactly the slot id we put in the TX frame
+(`xnu/patches/0136-topaz-htt-tx-compl.patch`).
+
+`htt_rx()` consumes the report and makes the slot eligible
+`HTT_TX_SLOT_COMPL_MS` (20) after it, so a late DMA read of the payload keeps
+its grace period; a report for a packet sent less than 20 ms ago is ignored. If
+the firmware never sends `0x07` nothing changes — the 50 ms age rule stays as
+the fallback, so this cannot make the ring more aggressive than the code it
+replaces.
+
 ### Modem poll cadence: stop spinning at 1 kHz (0135, 2026-10-22)
 
 Nothing in the modem stack is interrupt wired end to end: glink RX, the
@@ -24,8 +41,9 @@ starts once `api_ready` is set, so firmware download, scan and association all
 still run at 1 ms. `topazpoll=<ms>` sets the idle cadence (default 4, clamped
 to 50; `0` or `1` restores the old always-1 ms behaviour).
 
-Status: verified to apply by `git apply --check` against the post-0134 tree;
-compiles in CI (see the run for the commit that adds it). No device measurement
+Status: verified by `git apply --check` against the post-0134 tree and green in
+CI (run `39738676132`, commit `970ff33` — Build, Verify patches applied, host
+unit tests and the build-tree package all succeeded). No device measurement
 yet — the intended confirmation is CPU idle/residency on the phone, not a log
 line.
 

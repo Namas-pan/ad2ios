@@ -1,0 +1,87 @@
+Subject: [PATCH] topaz: free HTT TX slots on firmware completion
+
+topaz_wlan_tx() only reuses a descriptor slot once its last use is 50 ms old,
+so the TX ring can carry 32 packets per 50 ms (about 640 pps) no matter what
+the link allows, and everything faster is dropped with "htt tx: no free slot".
+The firmware does report completed MSDUs (T2H 0x07: status in bits 0-2,
+num_msdus in bits 8-15, then one 16-bit MSDU id per entry, and that id is the
+slot id we hand out in the TX frame).
+
+htt_rx() now consumes the report and makes the slot eligible
+HTT_TX_SLOT_COMPL_MS (20) after it, which keeps a grace period for a late DMA
+read of the payload. A report for a packet sent less than 20 ms ago is ignored,
+and if the firmware never sends 0x07 nothing changes: the 50 ms age rule stays
+as the fallback.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 58be2f5..9d3f609 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -412,6 +412,7 @@ static void wlfw_arrive(uint32_t node, uint32_t port);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+ static void radio_poll(unsigned ms);
++static void htt_tx_complete(uint16_t sid, uint32_t now);
+ 
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+@@ -4280,6 +4281,7 @@ scan_start(void)
+ #define H2T_TX_FRM          1
+ #define T2H_VERSION_CONF    0x00
+ #define T2H_RX_IN_ORD_PADDR_IND 0x12
++#define T2H_TX_COMPL_IND    0x07
+ #define HTT_RING_SIZE       256
+ #define HTT_BUF_SIZE        2048
+ #define HTT_MAX_PENDING_TX  (1024 + 32)
+@@ -4423,6 +4425,18 @@ htt_rx(const uint8_t *p, uint32_t len)
+ 		}
+ 		return;
+ 	}
++	if (type == T2H_TX_COMPL_IND && len >= 2) {
++		uint16_t w;
++		uint32_t n;
++		memcpy(&w, p + 1, 2);
++		n = ((uint32_t)w >> 8) & 0xFF;
++		for (uint32_t i = 0; i < n && 3 + (i + 1) * 2 <= len; i++) {
++			uint16_t sid;
++			memcpy(&sid, p + 3 + (size_t)i * 2, 2);
++			htt_tx_complete(sid, g_ms);
++		}
++		return;
++	}
+ 	if (type == T2H_RX_IN_ORD_PADDR_IND && len >= 8) {
+ 		uint16_t n;
+ 		memcpy(&n, p + 6, 2);
+@@ -5453,6 +5467,32 @@ static uint32_t htt_tx_next, htt_tx_sent;
+ #define HTT_TX_SLOT_AGE_MS 50
+ static uint32_t htt_tx_ms[HTT_TX_SLOTS];
+ static uint32_t htt_tx_full;
++#define HTT_TX_SLOT_COMPL_MS 20
++static uint32_t htt_tx_compl;
++/*
++ * Firmware TX completion (T2H 0x07). The MSDU ids in the report are the slot
++ * ids we put in the TX frame. Freeing a slot immediately would race a late DMA
++ * read of the payload, so a completion only makes the slot eligible
++ * HTT_TX_SLOT_COMPL_MS later; HTT_TX_SLOT_AGE_MS stays as the fallback for the
++ * case where the firmware reports nothing. Without this the TX ring only
++ * frees slots by age, i.e. 32 packets per 50 ms (~640 pps), and everything
++ * faster is dropped.
++ */
++static void
++htt_tx_complete(uint16_t sid, uint32_t now)
++{
++	if (sid >= HTT_TX_SLOTS || htt_tx_ms[sid] == 0) {
++		return;
++	}
++	if (now - htt_tx_ms[sid] < HTT_TX_SLOT_COMPL_MS) {
++		return;                          /* report for a packet sent just now */
++	}
++	htt_tx_ms[sid] = now - (HTT_TX_SLOT_AGE_MS - HTT_TX_SLOT_COMPL_MS);
++	htt_tx_compl++;
++	if (htt_tx_compl == 1) {
++		LOG("t=%u ms: htt: TX completions are reported", now);
++	}
++}
+ 
+ extern "C" bool
+ topaz_wlan_tx(const uint8_t *frame, unsigned len)

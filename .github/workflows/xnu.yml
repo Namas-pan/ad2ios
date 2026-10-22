@@ -130,7 +130,10 @@ jobs:
           # 0135: adaptive poll cadence for the modem datapath.
           grep -q 'a_poll_idle_ms' xnu/iokit/Kernel/arm/TopazModem.cpp
           grep -q 'poll_kick_ms' xnu/iokit/Kernel/arm/TopazModem.cpp
-          echo "WLAN patch (0133 consolidated), display patch (0134) and poll patch (0135) are present"
+          # 0136: HTT TX slots released on firmware completion.
+          grep -q 'T2H_TX_COMPL_IND' xnu/iokit/Kernel/arm/TopazModem.cpp
+          grep -q 'htt_tx_complete' xnu/iokit/Kernel/arm/TopazModem.cpp
+          echo "patches 0133-0136 (WLAN, display, poll cadence, TX completion) are present"
 
       - name: Host unit tests (WPA2 crypto, IPv4/DHCP helpers)
         if: always()
