@@ -111,10 +111,14 @@ jobs:
         run: |
           set -e
           # build.sh treats a rejected patch as a warning; make that fatal here.
-          # These sentinels cover the 0129-0146 WLAN chain and the 0144 family.
+          # These sentinels cover the 0125-0133 WLAN chain (0133 is the
+          # generated consolidated patch that replaced 0134-0146).
           grep -q 'topaz_wlan_wpa.c' xnu/bsd/conf/files
+          grep -q 'topaz_wlan_sysctl.c' xnu/bsd/conf/files
           grep -q 'topaz_wlan_set_psk' xnu/iokit/Kernel/arm/TopazModem.cpp
+          grep -q 'topaz_wlan_if_on_authorized' xnu/iokit/Kernel/arm/TopazModem.cpp
           grep -q 'topaz_wlan_enet_set_rx' xnu/bsd/sys/topaz_wlan.h
+          grep -q 'topaz_wlan_wpa.h' xnu/bsd/sys/Makefile
           grep -q 'SWEET_IONET_CPPO' xnu/iokit/conf/Makefile.template
           test -f xnu/iokit/Families/IONetworkingFamily/IONetworkStack.cpp
           echo "WLAN/IONetworkingFamily patches are present"

@@ -4,6 +4,30 @@
 
 **This checkout is ios-topaz**, not the sweet phone. Public overview: [`README.md`](README.md). Sweet's long engineering log starts under "sweet history" below — treat it as upstream context, not the current device state.
 
+### Patch chain consolidation (2026-10-22) — read this before touching patches
+
+The hand-written series `0133`–`0146` never applied as a chain: each file was authored against a
+slightly different tree, so `git apply` (no fuzz) skipped them and `build.sh` only warns. Repairing
+them hunk-by-hunk does not converge (fixing `0134` breaks `0135`, `0139`, ...).
+
+Current state: `xnu/patches/0133-topaz-wlan-all.patch` is **one generated diff** (base = xnu after
+`0125`–`0132`) that replaces the deleted `0133`–`0146`. It was produced by applying the old series
+with fuzz-tolerant `patch -F 3` in a scratch clone of the CI tree, fixing the two hunks that even
+fuzz could not place (the `topaz_wlan_if_on_authorized()` declaration in `bsd/sys/topaz_wlan.h`
+and its call in the `if (!a_rsn)` assoc path of `iokit/Kernel/arm/TopazModem.cpp`), then letting
+`git diff` regenerate exact context. `git apply --check` passes against the post-`0132` tree.
+
+Contents: `bsd/dev/topaz_wlan_if.c` (HTT Ethernet datapath, RX lock, GARP, DHCP client with reply
+validation, static `wifiip=` config), new `bsd/dev/topaz_wlan_sysctl.c`, `bsd/sys/topaz_wlan.h`
+(+ `topaz_wlan_wpa.h` added to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`), `TopazModem.cpp`
+(assoc/PTK hooks, HTT `T2H 0x07` TX completion), new `iokit/Kernel/arm/TopazWlan.cpp`,
+`iokit/KernelConfigTables.cpp`, `iokit/conf/files.arm64`, `iokit/conf/Makefile.template`,
+`config/MASTER*`.
+
+Rule going forward: never hand-edit hunk headers again — edit the source tree, re-run the builder
+and regenerate the patch. `xnu.yml`'s "Verify patches applied" step now greps for
+`topaz_wlan_sysctl.c`, `topaz_wlan_if_on_authorized`, `topaz_wlan_wpa.h` in `bsd/sys/Makefile`.
+
 ### Offline code-review fixes (2026-10-21, unverified by CI)
 
 - **0139**: retargeted the `topaz_wlan_set_psk()` hunk from the file head to just after the `a_boot_psk` declarations (context-verified with a synthetic `git apply`).
