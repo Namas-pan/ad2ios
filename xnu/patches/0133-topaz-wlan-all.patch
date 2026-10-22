@@ -1,16 +1,3 @@
-Subject: [PATCH] topaz-0133..0146: consolidated WLAN datapath, IPv4/DHCP, sysctl
-
-One generated diff against xnu-8796 after 0125-0132 applied. It replaces the
-hand-written 0133-0146 series, which drifted out of context and never applied
-as a chain (build.sh only warns, so it silently skipped them).
-
-Contents: bsd/dev/topaz_wlan_if.c (HTT Ethernet datapath, RX lock, ARP/GARP,
-DHCP client with reply validation, static wifiip= config, ioctl), new
-bsd/dev/topaz_wlan_sysctl.c, bsd/sys/topaz_wlan.h (+ export of
-topaz_wlan_wpa.h in bsd/sys/Makefile), iokit/Kernel/arm/TopazModem.cpp
-(assoc/PTK hooks, HTT T2H TX completion), new iokit/Kernel/arm/TopazWlan.cpp
-(IOService nub), iokit/KernelConfigTables.cpp, iokit/conf/files.arm64,
-iokit/conf/Makefile.template, config/MASTER*.
 diff --git a/bsd/conf/files b/bsd/conf/files
 index 57c93fa..2484260 100644
 --- a/bsd/conf/files
@@ -24,7 +11,7 @@ index 57c93fa..2484260 100644
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
 diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
-index a38057c..4572e44 100644
+index a38057c..7297394 100644
 --- a/bsd/dev/topaz_wlan_if.c
 +++ b/bsd/dev/topaz_wlan_if.c
 @@ -1,6 +1,10 @@
@@ -58,7 +45,7 @@ index a38057c..4572e44 100644
  #include <pexpert/pexpert.h>
  #include <kern/locks.h>
  
-@@ -23,15 +31,651 @@ static lck_mtx_t *tw_lock;
+@@ -23,15 +31,647 @@ static lck_mtx_t *tw_lock;
  static int tw_enabled = 1;
  static bool tw_hooked;
  static bool tw_attached;
@@ -257,24 +244,20 @@ index a38057c..4572e44 100644
 +		sin->sin_addr.s_addr = htonl(ip | ~mask);
 +		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
 +	}
-+	if (err == 0 && gw != 0 && so != NULL) {
-+		struct ortentry rt;
++	if (err == 0 && gw != 0) {
++		struct sockaddr_in dst, gwm, msk;
++		struct rtentry *rt = NULL;
 +
-+		bzero(&rt, sizeof(rt));
-+		rt.rt_flags = RTF_UP | RTF_GATEWAY;
-+		sin = (struct sockaddr_in *)&rt.rt_dst;
-+		sin->sin_len = sizeof(*sin);
-+		sin->sin_family = AF_INET;
-+		sin->sin_addr.s_addr = htonl(0);
-+		sin = (struct sockaddr_in *)&rt.rt_gateway;
-+		sin->sin_len = sizeof(*sin);
-+		sin->sin_family = AF_INET;
-+		sin->sin_addr.s_addr = htonl(gw);
-+		sin = (struct sockaddr_in *)&rt.rt_genmask;
-+		sin->sin_len = sizeof(*sin);
-+		sin->sin_family = AF_INET;
-+		sin->sin_addr.s_addr = htonl(0);
-+		(void)sock_ioctl(so, SIOCADDRT, &rt);
++		bzero(&dst, sizeof(dst));
++		dst.sin_len = sizeof(dst);
++		dst.sin_family = AF_INET;
++		dst.sin_addr.s_addr = htonl(0);
++		gwm = dst;
++		gwm.sin_addr.s_addr = htonl(gw);
++		msk = dst;
++		(void)rtrequest(RTM_ADD, (struct sockaddr *)&dst,
++		    (struct sockaddr *)&gwm, (struct sockaddr *)&msk,
++		    RTF_UP | RTF_GATEWAY | RTF_STATIC, &rt);
 +	}
 +	if (so != NULL) {
 +		sock_close(so);
@@ -712,7 +695,7 @@ index a38057c..4572e44 100644
  	return 0;
  }
  
-@@ -40,9 +684,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
+@@ -40,9 +680,13 @@ tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
  {
  	switch (cmd) {
  	case SIOCSIFADDR:
@@ -726,7 +709,7 @@ index a38057c..4572e44 100644
  	default:
  		return EOPNOTSUPP;
  	}
-@@ -104,7 +752,7 @@ tw_attach_ifnet(void)
+@@ -104,7 +748,7 @@ tw_attach_ifnet(void)
  	ifnet_set_addrlen(tw_ifp, ETHER_ADDR_LEN);
  	ifnet_set_hdrlen(tw_ifp, sizeof(struct ether_header));
  	ifnet_set_mtu(tw_ifp, ETHERMTU);
@@ -735,7 +718,7 @@ index a38057c..4572e44 100644
  	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
  	if (ifnet_attach(tw_ifp, NULL) != 0) {
  		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
-@@ -114,20 +762,169 @@ tw_attach_ifnet(void)
+@@ -114,20 +758,169 @@ tw_attach_ifnet(void)
  	ifnet_set_lladdr(tw_ifp, mac, ETHER_ADDR_LEN);
  	ifnet_set_flags(tw_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
  	tw_attached = true;
@@ -910,7 +893,7 @@ index a38057c..4572e44 100644
  void
  topaz_wlan_if_init(void)
  {
-@@ -141,15 +938,39 @@ topaz_wlan_if_init(void)
+@@ -141,15 +934,39 @@ topaz_wlan_if_init(void)
  	}
  	tw_hooked = true;
  	topaz_wlan_ready_hook = tw_on_ready;
@@ -1298,36 +1281,19 @@ index 2e1e555..75a619f 100644
  
  #ifdef __cplusplus
  }
-diff --git a/config/MASTER b/config/MASTER
-index 4fde794..9894aae 100644
---- a/config/MASTER
-+++ b/config/MASTER
-@@ -114,6 +114,7 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
- #
- options		MOCKFS		# Boot from an executable	# <mockfs>
- options		SWEET_HFS	# Built-in Apple OSS HFS (SWEET)	# <sweet_hfs>
-+options		SWEET_IONET	# Built-in IONetworkingFamily (SWEET)	# <sweet_ionet>
- options		FIFO		# fifo support			# <fifo>
- options		FDESC		# fdesc_fs support		# <fdesc>
- options		DEVFS		# devfs support			# <devfs>
-diff --git a/config/MASTER.arm64.sweet b/config/MASTER.arm64.sweet
-index e305f0d..9bf474d 100644
---- a/config/MASTER.arm64.sweet
-+++ b/config/MASTER.arm64.sweet
-@@ -52,7 +52,7 @@
- #else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
- #  HIBERNATION =    [ ]
- #endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
--#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
-+#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION sweet_ionet ]
- #  IOKIT_RELEASE =  [ IOKIT_BASE ]
- #  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
- #  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index d2f41ce..6d1368e 100644
+index d2f41ce..d6345d8 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -4578,6 +4578,7 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+@@ -23,6 +23,7 @@
+ #include <libkern/crc.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include <sys/topaz_wlan.h>
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -4578,6 +4579,7 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
  
  /* ---------------- open-network station association (topaz-woa assoc.c) */
  #include <sys/topaz_wlan_wpa.h>
@@ -1335,7 +1301,7 @@ index d2f41ce..6d1368e 100644
  
  #define CMD_VDEV_START      0x5003
  #define CMD_VDEV_UP         0x5005
-@@ -4645,6 +4646,27 @@ static bool a_auto_tried;
+@@ -4645,6 +4647,27 @@ static bool a_auto_tried;
  static char a_boot_psk[64];
  static bool a_boot_psk_set;
  
@@ -1363,7 +1329,7 @@ index d2f41ce..6d1368e 100644
  static uint8_t *
  a_pmac(uint8_t *p, const uint8_t *mac)
  {
-@@ -4905,8 +4927,95 @@ a_build_assoc_req(uint8_t *f, uint32_t max)
+@@ -4905,11 +4928,17 @@ a_build_assoc_req(uint8_t *f, uint32_t max)
  
  static void a_teardown(void);
  static void a_fail(int status);
@@ -1373,93 +1339,45 @@ index d2f41ce..6d1368e 100644
 +static void a_begin(void);
 +extern "C" void topaz_wlan_if_on_disconnected(void);
 +
-+static void
-+a_teardown(void)
-+{
-+	bool was_up = (a_state == A_UP) || a_up;
-+
-+	if (a_state >= A_START) {
-+		if (a_state == A_UP) {
-+			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
-+		}
-+		if (a_state >= A_AUTH) {
-+			a_peer_delete(a_req.bssid);
-+		}
-+		a_vdev_simple(CMD_VDEV_STOP, TAG_VDEV_STOP);
-+	}
-+	a_state = A_IDLE;
-+	a_up = false;
-+	a_ptk = false;
-+	topaz_wlan_wpa_reset();
-+	if (was_up) {
-+		topaz_wlan_if_on_disconnected();
-+	}
-+}
-+
-+static void
-+a_fail(int status)
-+{
-+	LOG("t=%u ms: assoc: failed (%d) state %u", g_ms, status, a_state);
-+	a_teardown();
-+}
-+
-+static void
-+a_arm(void)
-+{
-+	a_deadline = g_ms + ASSOC_WAIT_MS;
-+}
-+
-+static void
-+a_start_auth(void)
-+{
-+	a_state = A_AUTH;
-+	a_tries = 1;
-+	a_peer_create(a_req.bssid);
-+	a_send_auth();
-+	a_arm();
-+}
-+
-+static void
-+a_start_assoc(void)
-+{
-+	a_state = A_ASSOC;
-+	a_tries = 1;
-+	a_areq_len = a_build_assoc_req(a_areq, sizeof(a_areq));
-+	a_send_mgmt(a_areq, a_areq_len);
-+	a_arm();
-+}
-+
-+static void
-+a_begin(void)
-+{
-+	uint32_t bcn = 100, dtim = 1;
-+	const uint8_t *tim;
-+
-+	if (a_req.body_len >= 12) {
-+		bcn = (uint32_t)a_req.body[8] | ((uint32_t)a_req.body[9] << 8);
-+	}
-+	tim = a_find_ie(a_req.body, a_req.body_len, 5);
-+	if (tim != NULL && tim[1] >= 2 && tim[3] != 0) {
-+		dtim = tim[3];
-+	}
-+	a_areq_len = a_aresp_len = 0;
-+	a_start_resp = false;
-+	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz %s '%.*s'", g_ms,
-+	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
-+	    a_rsn ? "WPA2" : "open", (int)a_req.ssid_len, a_req.ssid);
-+	a_ps_off();
-+	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
-+		a_fail(-2);
-+		return;
-+	}
-+	a_state = A_START;
-+	a_deadline = g_ms + 1500;
-+}
-+
  static void
  a_teardown(void)
  {
-@@ -5002,6 +5111,7 @@ static void a_on_up(void)
++	bool was_up = (a_state == A_UP) || a_up;
++
+ 	if (a_state >= A_START) {
+ 		if (a_state == A_UP) {
+ 			a_vdev_simple(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
+@@ -4923,6 +4952,9 @@ a_teardown(void)
+ 	a_up = false;
+ 	a_ptk = false;
+ 	topaz_wlan_wpa_reset();
++	if (was_up) {
++		topaz_wlan_if_on_disconnected();
++	}
+ }
+ 
+ static void
+@@ -4973,9 +5005,9 @@ a_begin(void)
+ 	}
+ 	a_areq_len = a_aresp_len = 0;
+ 	a_start_resp = false;
+-	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz open '%.*s'", g_ms,
++	LOG("t=%u ms: assoc: %02x:%02x:%02x:**:**:** %u MHz %s '%.*s'", g_ms,
+ 	    a_req.bssid[0], a_req.bssid[1], a_req.bssid[2], a_req.freq,
+-	    (int)a_req.ssid_len, a_req.ssid);
++	    a_rsn ? "WPA2" : "open", (int)a_req.ssid_len, a_req.ssid);
+ 	a_ps_off();
+ 	if (!a_vdev_start(a_req.freq, bcn, dtim)) {
+ 		a_fail(-2);
+@@ -4984,6 +5016,7 @@ a_begin(void)
+ 	a_state = A_START;
+ 	a_deadline = g_ms + 1500;
+ }
++
+ static void a_on_up(void)
+ {
+ 	uint8_t rates[16];
+@@ -5002,6 +5035,7 @@ static void a_on_up(void)
  	if (!a_rsn) {
  		a_peer_param(a_req.bssid, PEER_PARAM_AUTHORIZE, 1);
  		a_ptk = true;
@@ -1467,7 +1385,7 @@ index d2f41ce..6d1368e 100644
  	}
  	a_state = A_UP;
  	a_up = true;
-@@ -5273,47 +5383,103 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
+@@ -5273,47 +5307,103 @@ topaz_wlan_install_key(bool group, unsigned key_idx, unsigned cipher,
  static void
  assoc_on_rx_msdu(const uint8_t *frame, uint32_t len)
  {
@@ -1604,7 +1522,7 @@ index d2f41ce..6d1368e 100644
  	}
  }
  
-@@ -5382,6 +5548,43 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
+@@ -5382,6 +5472,43 @@ topaz_wlan_tx(const uint8_t *frame, unsigned len)
  	return true;
  }
  
@@ -1648,7 +1566,15 @@ index d2f41ce..6d1368e 100644
  extern "C" int
  topaz_wlan_connect_bss(unsigned index)
  {
-@@ -5520,6 +5723,7 @@ radio_poll(unsigned ms)
+@@ -5391,7 +5518,6 @@ topaz_wlan_connect_bss(unsigned index)
+ 	assoc_fill_from_bss(&bss[index]);
+ 	return 0;
+ }/* ---------------- the radio for the rest of the kernel (<sys/topaz_wlan.h>) */
+-#include <sys/topaz_wlan.h>
+ 
+ void (*topaz_wlan_ready_hook)(void);
+ 
+@@ -5520,6 +5646,7 @@ radio_poll(unsigned ms)
  	(void)ce_poll();
  	htt_poll();
  	assoc_poll();
@@ -2002,44 +1928,16 @@ index 92f3e26..742fefe 100644
      "   {"
      "     'IOClass'         = IOPanicPlatform;"
 diff --git a/iokit/conf/Makefile.template b/iokit/conf/Makefile.template
-index 7613d9b..e5fca76 100644
+index 7613d9b..66e0510 100644
 --- a/iokit/conf/Makefile.template
 +++ b/iokit/conf/Makefile.template
-@@ -25,6 +25,13 @@ CFLAGS_RELEASE += -DIOASSERT=0
+@@ -25,6 +25,9 @@ CFLAGS_RELEASE += -DIOASSERT=0
  CFLAGS_DEVELOPMENT += -DIOASSERT=1
  CFLAGS_DEBUG += -DIOASSERT=1
  
 +# SWEET 0146: IONetworkingFamily units compile to *.cpo. Private headers
 +# sit next to the sources. xnu's per-file hook is _CXXWARNFLAGS_ADD.
-+SWEET_IONET_ROOT = $(SRCROOT)/iokit/Families/IONetworkingFamily
-+SWEET_IONET_CPPO = IONetworkController.cpo IONetworkInterface.cpo IOEthernetController.cpo IOEthernetInterface.cpo IONetworkData.cpo IONetworkMedium.cpo IOOutputQueue.cpo IOPacketQueue.cpo IOMbufMemoryCursor.cpo IONetworkStack.cpo IONetworkUserClient.cpo IOKernelDebugger.cpo TopazWlan.cpo
-+CXXFLAGS += -I$(SWEET_IONET_ROOT)
-+$(foreach o,$(SWEET_IONET_CPPO),$(eval $(o)_CXXWARNFLAGS_ADD += -Wno-cast-align -Wno-cast-qual -Wno-shadow -Wno-sign-conversion -Wno-unused-parameter -Wno-deprecated-declarations))
 +
  #
  # Directories for generated files
  #
-diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index 8b2b868..428bd11 100644
---- a/iokit/conf/files.arm64
-+++ b/iokit/conf/files.arm64
-@@ -11,6 +11,19 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
- 
- iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
- iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
-+iokit/Kernel/arm/TopazWlan.cpp                                   optional iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkController.cpp        optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkInterface.cpp         optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOEthernetController.cpp       optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOEthernetInterface.cpp        optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkData.cpp              optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkMedium.cpp            optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOOutputQueue.cpp              optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOPacketQueue.cpp              optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOMbufMemoryCursor.cpp         optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkStack.cpp             optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IONetworkUserClient.cpp        optional sweet_ionet iokitcpp
-+iokit/Families/IONetworkingFamily/IOKernelDebugger.cpp           optional sweet_ionet iokitcpp
- iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
- iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
- iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp

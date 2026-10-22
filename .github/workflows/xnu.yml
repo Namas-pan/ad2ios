@@ -119,9 +119,9 @@ jobs:
           grep -q 'topaz_wlan_if_on_authorized' xnu/iokit/Kernel/arm/TopazModem.cpp
           grep -q 'topaz_wlan_enet_set_rx' xnu/bsd/sys/topaz_wlan.h
           grep -q 'topaz_wlan_wpa.h' xnu/bsd/sys/Makefile
-          grep -q 'SWEET_IONET_CPPO' xnu/iokit/conf/Makefile.template
-          test -f xnu/iokit/Families/IONetworkingFamily/IONetworkStack.cpp
-          echo "WLAN/IONetworkingFamily patches are present"
+          grep -q 'topaz_wlan_tx' xnu/bsd/sys/topaz_wlan.h
+          grep -q 'rtrequest' xnu/bsd/dev/topaz_wlan_if.c
+          echo "WLAN patch (0133 consolidated) is present"
 
       - name: Package build tree for local compiles
         if: always()

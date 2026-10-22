@@ -28,6 +28,38 @@ Rule going forward: never hand-edit hunk headers again — edit the source tree,
 and regenerate the patch. `xnu.yml`'s "Verify patches applied" step now greps for
 `topaz_wlan_sysctl.c`, `topaz_wlan_if_on_authorized`, `topaz_wlan_wpa.h` in `bsd/sys/Makefile`.
 
+### IONetworkingFamily dropped; 0133 regenerated (2026-10-22, later)
+
+CI run 39719313278 proved the consolidated patch applies but does not compile. Two independent
+problems, both fixed in the tree and re-generated into `0133-topaz-wlan-all.patch`:
+
+- **The Apple `IONetworkingFamily` sources cannot be built in this tree.** The seven headers that
+  family needs (`IONetworkController.h`, `IONetworkInterface.h`, `IOEthernetController.h`, ...) do
+  not exist in xnu at all, and the copies present (`IONetworkController.cpp` etc.) are from a newer
+  IOKit than the headers the kernel is compiled against, so they fail with
+  `out-of-line definition of 'outputStart' does not match any declaration in 'IONetworkController'`,
+  unknown `IOMbufServiceClass`, and `IONetworkUserClient.h` / `classq.h` not found. The whole family,
+  `TopazWlan.cpp`, the `sweet_ionet` option and the `SWEET_IONET_CPPO` glue in
+  `iokit/conf/Makefile.template` were **removed**; the datapath is the pure-C `tw0` ifnet in
+  `bsd/dev/topaz_wlan_if.c`, which is what actually carries traffic.
+- **Global `CXXFLAGS += -I$(SWEET_IONET_ROOT)` was poisoning unrelated IOKit C++.** The family
+  directory ships its own `TargetConditionals.h`, so with that `-I` first every IOKit translation
+  unit saw the wrong `TARGET_OS_*` values; `iokit/Kernel/arm/hid/*.cpp` then compiled down a branch
+  without the `exit` label and 56 `use of undeclared identifier 'exit'` errors appeared in
+  `IOHIDEvent.cpp` (they do not occur in the pre-0133 builds). Removing the global include fixed it.
+- `topaz_wlan_if.c` used `struct ortentry` + `SIOCADDRT`, neither of which exists in this xnu
+  (no route ioctl support at all). The default route is now installed with
+  `rtrequest(RTM_ADD, dst, gw, mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, &rt)` from `<net/route.h>`.
+- `TopazModem.cpp` had the fuzz repair duplicated: `a_teardown`/`a_fail`/`a_arm`/`a_start_auth`/
+  `a_start_assoc`/`a_begin` were defined twice (the second `a_begin` was the older open-only copy).
+  The duplicate block was deleted, and `<sys/topaz_wlan.h>` is now included at the top instead of
+  only near the end of the file, so `topaz_wlan_if_on_authorized()` and `topaz_wlan_tx()` are
+  declared where they are first used.
+
+`iokit/Kernel/arm/TopazWlan.cpp` is still created by the patch but no longer listed in
+`files.arm64`; `KernelConfigTables.cpp`'s `IOClass = TopazWlan` personality therefore matches
+nothing at runtime. That is intentional until the IONetworkingFamily headers exist.
+
 ### Offline code-review fixes (2026-10-21, unverified by CI)
 
 - **0139**: retargeted the `topaz_wlan_set_psk()` hunk from the file head to just after the `a_boot_psk` declarations (context-verified with a synthetic `git apply`).
