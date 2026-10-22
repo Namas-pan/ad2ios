@@ -30,29 +30,21 @@ diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 +    const uint8_t *key, unsigned key_len);          /* cipher 4 = CCMP */
 +bool topaz_wlan_tx(const uint8_t *frame, unsigned len); /* native 802.11 via HTT */
  
- /* bsd/dev/topaz_wlan_if.c 鈥?register hook early (before topaz_modem_init). */
+ /* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
  void topaz_wlan_if_init(void);
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -17,9 +17,11 @@ scan_start(void)
+@@ -17,6 +17,7 @@ scan_start(void)
  #define H2T_RX_RING_CFG     2
  #define H2T_AGGR_CFG        5
  #define H2T_FRAG_DESC_BANK_CFG 6
 +#define H2T_TX_FRM          1
  #define T2H_VERSION_CONF    0x00
-+#define T2H_TX_COMPL_IND    0x07
  #define T2H_RX_IN_ORD_PADDR_IND 0x12
  #define HTT_RING_SIZE       256
- #define HTT_BUF_SIZE        2048
- #define HTT_MAX_PENDING_TX  (1024 + 32)
- #define HTT_EXT_DESC_SIZE   72
-@@ -42,10 +43,13 @@ static volatile uint32_t *htt_idx;
+@@ -42,6 +43,9 @@ static volatile uint32_t *htt_idx;
  static uint32_t htt_alloc, htt_state, htt_msgs, htt_msdus, htt_req_ms;
- static volatile uint8_t htt_tx_busy[HTT_TX_SLOTS];
- 
- extern "C" void topaz_wlan_tx_lock(void);
- extern "C" void topaz_wlan_tx_unlock(void);
  
  static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
 +static void assoc_on_rx_msdu(const uint8_t *frame, uint32_t len);
@@ -290,7 +282,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  	}
  	if (scans != a_last_scans) {
  		a_last_scans = scans;
-@@ -774,15 +744,163 @@ topaz_wlan_associated(void)
+@@ -774,15 +744,140 @@ topaz_wlan_associated(void)
  	return a_up;
  }
  
@@ -358,6 +350,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +}
 +
 +/* HTT native-wifi TX (topaz-woa htt.c TxOne); EAPOL / data once associated. */
++#define HTT_TX_SLOTS     32
 +#define HTT_TX_SLOT_SIZE 2048
 +#define HTT_PREFETCH     50
 +static uint8_t *htt_tx_pool;
@@ -370,40 +363,20 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	uint8_t m[20 + 52], *p, *ext, f0;
 +	uint32_t id, pf;
 +	uint64_t pa;
-+	bool eapol, ok = false;
++	bool eapol;
 +
 +	if (!a_up || frame == NULL || len < 24 || len > HTT_TX_SLOT_SIZE ||
 +	    htt_state != 2 || htt_bank == NULL) {
 +		return false;
 +	}
-+	topaz_wlan_tx_lock();
 +	if (htt_tx_pool == NULL) {
 +		htt_tx_pool = (uint8_t *)pool_alloc(
 +		    HTT_TX_SLOTS * HTT_TX_SLOT_SIZE, &htt_tx_pool_pa);
 +		if (htt_tx_pool == NULL) {
-+			goto out;
++			return false;
 +		}
 +	}
-+	{
-+		uint32_t i;
-+		int slot = -1;
-+
-+		for (i = 0; i < HTT_TX_SLOTS; i++) {
-+			uint32_t s = (htt_tx_next + i) % HTT_TX_SLOTS;
-+
-+			if (!htt_tx_busy[s]) {
-+				slot = (int)s;
-+				htt_tx_next = (s + 1) % HTT_TX_SLOTS;
-+				break;
-+			}
-+		}
-+		if (slot < 0) {
-+			LOG("t=%u ms: htt tx ring full", g_ms);
-+			goto out; /* all slots await TX_COMPL_IND */
-+		}
-+		id = (uint32_t)slot;
-+		htt_tx_busy[id] = 1;
-+	}
++	id = htt_tx_next++ % HTT_TX_SLOTS;
 +	pa = htt_tx_pool_pa + (uint64_t)id * HTT_TX_SLOT_SIZE;
 +	memcpy(htt_tx_pool + (size_t)id * HTT_TX_SLOT_SIZE, frame, len);
 +	ext = htt_bank + (size_t)id * HTT_EXT_DESC_SIZE;
@@ -431,18 +404,14 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	p += 4;
 +	memcpy(p, frame, MIN(len, pf));
 +	if (!htt_send(m, 20 + pf)) {
-+		htt_tx_busy[id] = 0;
-+		goto out;
++		return false;
 +	}
 +	htt_tx_sent++;
 +	if (htt_tx_sent <= 8) {
 +		LOG("t=%u ms: htt tx id %u len %u%s", g_ms, id, len,
 +		    eapol ? " EAPOL" : "");
 +	}
-+	ok = true;
-+out:
-+	topaz_wlan_tx_unlock();
-+	return ok;
++	return true;
 +}
 +
  extern "C" int

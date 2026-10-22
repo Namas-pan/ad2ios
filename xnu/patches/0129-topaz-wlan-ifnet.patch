@@ -22,7 +22,7 @@ diff --git a/bsd/sys/topaz_wlan.h b/bsd/sys/topaz_wlan.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/sys/topaz_wlan.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,41 @@
 +/*
 + * topaz: WCN3988 radio C API (implemented in iokit/Kernel/arm/TopazModem.cpp
 + * when boot-arg wifi=1). Scan + BSS list with beacon IEs; ready hook for
@@ -58,10 +58,6 @@ new file mode 100644
 +
 +/* bsd/dev/topaz_wlan_if.c — register hook early (before topaz_modem_init). */
 +void topaz_wlan_if_init(void);
-+bool topaz_wlan_if_active(void);                    /* tw0 attached */
-+void topaz_wlan_if_set_suppressed(bool on);         /* 0145: one datapath */
-+void topaz_wlan_tx_lock(void);                      /* serialise HTT TX */
-+void topaz_wlan_tx_unlock(void);
 +
 +#ifdef __cplusplus
 +}
@@ -72,7 +68,7 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/topaz_wlan_if.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,155 @@
 +/*
 + * topaz: attach ifnet tw0 when TopazModem WLAN radio is ready (0126 API).
 + * Stub only — no assoc / datapath. Output frees mbufs. sweetwlanif=0 skips.
@@ -98,7 +94,6 @@ new file mode 100644
 +static int tw_enabled = 1;
 +static bool tw_hooked;
 +static bool tw_attached;
-+static bool tw_suppressed;
 +
 +static errno_t
 +tw_output(ifnet_t ifp, mbuf_t m)
@@ -112,21 +107,12 @@ new file mode 100644
 +}
 +
 +static errno_t
-+tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++tw_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
 +{
 +	switch (cmd) {
 +	case SIOCSIFADDR:
-+		return 0;
 +	case SIOCSIFFLAGS:
-+		if (data != NULL) {
-+			struct ifreq *ifr = (struct ifreq *)data;
-+
-+			if (ifr->ifr_flags & IFF_UP) {
-+				ifnet_set_flags(ifp, IFF_UP, IFF_UP);
-+			} else {
-+				ifnet_set_flags(ifp, 0, IFF_UP);
-+			}
-+		}
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
 +		return 0;
 +	default:
 +		return EOPNOTSUPP;
@@ -139,60 +125,26 @@ new file mode 100644
 +}
 +
 +static void
-+tw_lock_init(void)
-+{
-+	static lck_grp_t *grp;
-+
-+	if (grp == NULL) {
-+		grp = lck_grp_alloc_init("topaz_wlan", LCK_GRP_ATTR_NULL);
-+	}
-+	if (tw_lock == NULL && grp != NULL) {
-+		tw_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
-+	}
-+}
-+
-+void
-+topaz_wlan_if_set_suppressed(bool on)
-+{
-+	tw_suppressed = on;
-+}
-+
-+bool
-+topaz_wlan_if_active(void)
-+{
-+	return tw_attached && tw_ifp != NULL;
-+}
-+
-+void
-+topaz_wlan_tx_lock(void)
-+{
-+	if (tw_lock != NULL) {
-+		lck_mtx_lock(tw_lock);
-+	}
-+}
-+
-+void
-+topaz_wlan_tx_unlock(void)
-+{
-+	if (tw_lock != NULL) {
-+		lck_mtx_unlock(tw_lock);
-+	}
-+}
-+
-+static void
 +tw_attach_ifnet(void)
 +{
 +	struct ifnet_init_eparams init;
 +	uint8_t mac[6];
++	static lck_grp_t *grp;
 +
-+	if (tw_suppressed || tw_attached || tw_ifp != NULL) {
++	if (tw_attached || tw_ifp != NULL) {
 +		return;
 +	}
 +	if (!topaz_wlan_ready()) {
 +		return;
 +	}
 +	topaz_wlan_address(mac);
-+	tw_lock_init();
++
++	if (grp == NULL) {
++		grp = lck_grp_alloc_init("topaz_wlan", LCK_GRP_ATTR_NULL);
++	}
++	if (tw_lock == NULL) {
++		tw_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	}
 +
 +	bzero(&init, sizeof(init));
 +	init.ver = IFNET_INIT_CURRENT_VERSION;
@@ -227,7 +179,6 @@ new file mode 100644
 +	ifnet_set_flags(tw_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
 +	if (ifnet_attach(tw_ifp, NULL) != 0) {
 +		printf("SWEET WLAN: tw0 ifnet_attach failed\n");
-+		ifnet_release(tw_ifp);
 +		tw_ifp = NULL;
 +		return;
 +	}
@@ -252,7 +203,6 @@ new file mode 100644
 +topaz_wlan_if_init(void)
 +{
 +	(void)PE_parse_boot_argn("sweetwlanif", &tw_enabled, sizeof(tw_enabled));
-+	tw_lock_init();
 +	if (!tw_enabled) {
 +		printf("SWEET WLAN: ifnet disabled (sweetwlanif=0)\n");
 +		return;

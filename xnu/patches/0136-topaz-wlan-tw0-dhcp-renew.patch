@@ -196,11 +196,11 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
  			*server = (opt[i] << 24) | (opt[i + 1] << 16) |
  			    (opt[i + 2] << 8) | opt[i + 3];
 +		} else if (code == DHCP_OPT_LEASE && olen >= 4) {
-+			*lease = ((uint32_t)opt[i] << 24) | ((uint32_t)opt[i + 1] << 16) |
-+			    ((uint32_t)opt[i + 2] << 8) | opt[i + 3];
++			*lease = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
 +		} else if (code == DHCP_OPT_DNS && olen >= 4 && dns != NULL) {
-+			*dns = ((uint32_t)opt[i] << 24) | ((uint32_t)opt[i + 1] << 16) |
-+			    ((uint32_t)opt[i + 2] << 8) | opt[i + 3];
++			*dns = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
  		}
  		i += olen;
  	}
@@ -235,7 +235,7 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
  		tw_dhcp_last_ms = 0;
  		printf("SWEET WLAN: DHCP OFFER %u.%u.%u.%u from %u.%u.%u.%u\n",
  		    (yiaddr >> 24) & 0xff, (yiaddr >> 16) & 0xff,
-@@ -400,17 +458,47 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
+@@ -400,17 +458,43 @@ tw_dhcp_rx(const uint8_t *eth, unsigned len)
  		tw_dhcp_send(DHCPREQUEST);
  		return true;
  	}
@@ -269,12 +269,8 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
 +		if (!tw_addr_done) {
 +			tw_apply_ipv4(yiaddr, mask != 0 ? mask : tw_dhcp_mask, gw);
 +		}
-+		if (tw_addr_done) {
-+			tw_dhcp_yiaddr = yiaddr;
-+			tw_dhcp_arm_lease(now, lease);
-+		} else {
-+			printf("SWEET WLAN: DHCP ACK not applied; retrying\n");
-+		}
++		tw_dhcp_yiaddr = yiaddr;
++		tw_dhcp_arm_lease(now, lease);
 +		return true;
 +	}
 +	if (msg == DHCPNAK && (tw_dhcp_state == TW_DHCP_REQUEST ||

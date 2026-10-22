@@ -137,7 +137,7 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
  		printf("SWEET WLAN: tw0 %u.%u.%u.%u mask %u.%u.%u.%u%s\n",
  		    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
  		    (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff,
-@@ -167,6 +188,311 @@ tw_configure_ipv4(void)
+@@ -167,6 +188,304 @@ tw_configure_ipv4(void)
  	}
  }
  
@@ -270,14 +270,14 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
 +		if (code == DHCP_OPT_MSG && olen >= 1) {
 +			*msg = opt[i];
 +		} else if (code == DHCP_OPT_MASK && olen >= 4) {
-+			*mask = ((uint32_t)opt[i] << 24) | ((uint32_t)opt[i + 1] << 16) |
-+			    ((uint32_t)opt[i + 2] << 8) | opt[i + 3];
++			*mask = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
 +		} else if (code == DHCP_OPT_ROUTER && olen >= 4) {
-+			*gw = ((uint32_t)opt[i] << 24) | ((uint32_t)opt[i + 1] << 16) |
-+			    ((uint32_t)opt[i + 2] << 8) | opt[i + 3];
++			*gw = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
 +		} else if (code == DHCP_OPT_SERVER && olen >= 4) {
-+			*server = ((uint32_t)opt[i] << 24) | ((uint32_t)opt[i + 1] << 16) |
-+			    ((uint32_t)opt[i + 2] << 8) | opt[i + 3];
++			*server = (opt[i] << 24) | (opt[i + 1] << 16) |
++			    (opt[i + 2] << 8) | opt[i + 3];
 +		}
 +		i += olen;
 +	}
@@ -290,7 +290,7 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
 +	const uint8_t *ip, *udp, *boot, *opt;
 +	unsigned iplen, udplen;
 +	uint32_t xid, yiaddr, mask = 0xffffff00, gw = 0, server = 0;
-+	uint8_t msg = 0, mac[6];
++	uint8_t msg = 0;
 +
 +	if (tw_dhcp_state != TW_DHCP_DISCOVER && tw_dhcp_state != TW_DHCP_REQUEST) {
 +		return false;
@@ -306,27 +306,20 @@ diff --git a/bsd/dev/topaz_wlan_if.c b/bsd/dev/topaz_wlan_if.c
 +		return false;
 +	}
 +	iplen = ((unsigned)ip[0] & 0x0f) * 4;
-+	if (iplen < 20 || iplen > 60 || len < 14 + iplen + 8) {
-+		return false;
-+	}
-+	if (tw_ip_cksum(ip, iplen) != 0) {
++	if (len < 14 + iplen + 8) {
 +		return false;
 +	}
 +	udp = ip + iplen;
-+	if (udp[0] != 0 || udp[1] != 67 || udp[2] != 0 || udp[3] != 68) {
-+		return false; /* DHCP server port 67 -> client port 68 */
++	if (udp[2] != 0 || udp[3] != 68) { /* dport 68 */
++		return false;
 +	}
 +	udplen = ((unsigned)udp[4] << 8) | udp[5];
 +	if (udplen < 8 + 240 || 14 + iplen + udplen > len) {
 +		return false;
 +	}
 +	boot = udp + 8;
-+	if (boot[0] != 2 || boot[1] != 1 || boot[2] != 6) { /* BOOTREPLY, Ethernet */
++	if (boot[0] != 2) { /* BOOTREPLY */
 +		return false;
-+	}
-+	topaz_wlan_address(mac);
-+	if (memcmp(boot + 28, mac, 6) != 0) {
-+		return false; /* chaddr must be our station */
 +	}
 +	xid = ((uint32_t)boot[4] << 24) | ((uint32_t)boot[5] << 16) |
 +	    ((uint32_t)boot[6] << 8) | boot[7];

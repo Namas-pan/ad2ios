@@ -31,7 +31,7 @@ index 7b5a884..99ab541 100644
  }
  
  /* ---------------- WMI (TLV, ath10k wmi-tlv.c) and the passive scan */
-@@ -4245,6 +4247,213 @@ scan_start(void)
+@@ -4245,6 +4247,186 @@ scan_start(void)
  	    b ? "ok" : "FAILED", scanning ? "requested" : "FAILED");
  }
  
@@ -48,13 +48,11 @@ index 7b5a884..99ab541 100644
 +#define H2T_AGGR_CFG        5
 +#define H2T_FRAG_DESC_BANK_CFG 6
 +#define T2H_VERSION_CONF    0x00
-+#define T2H_TX_COMPL_IND    0x07
 +#define T2H_RX_IN_ORD_PADDR_IND 0x12
 +#define HTT_RING_SIZE       256
 +#define HTT_BUF_SIZE        2048
 +#define HTT_MAX_PENDING_TX  (1024 + 32)
 +#define HTT_EXT_DESC_SIZE   72
-+#define HTT_TX_SLOTS        32
 +/* wcn3990 htt_rx_desc_v2 offsets in 4-byte words */
 +#define OFF_ATTENTION       1
 +#define OFF_FRAG_INFO       2
@@ -72,10 +70,6 @@ index 7b5a884..99ab541 100644
 +static volatile uint64_t *htt_ring;
 +static volatile uint32_t *htt_idx;
 +static uint32_t htt_alloc, htt_state, htt_msgs, htt_msdus, htt_req_ms;
-+static volatile uint8_t htt_tx_busy[HTT_TX_SLOTS];
-+
-+extern "C" void topaz_wlan_tx_lock(void);
-+extern "C" void topaz_wlan_tx_unlock(void);
 +
 +static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
 +
@@ -187,27 +181,6 @@ index 7b5a884..99ab541 100644
 +{
 +	uint8_t type = len != 0 ? p[0] : 0xFF;
 +	htt_msgs++;
-+	if (type == T2H_TX_COMPL_IND) {
-+		uint16_t w;
-+		unsigned n, i;
-+
-+		if (len < 4) {
-+			return;
-+		}
-+		memcpy(&w, p, 2);
-+		n = (w >> 8) & 0xff;
-+		topaz_wlan_tx_lock();
-+		for (i = 0; i < n && 4 + (i + 1) * 2 <= len; i++) {
-+			uint16_t id;
-+
-+			memcpy(&id, p + 4 + i * 2, 2);
-+			if (id < HTT_TX_SLOTS) {
-+				htt_tx_busy[id] = 0;
-+			}
-+		}
-+		topaz_wlan_tx_unlock();
-+		return;
-+	}
 +	if (type == T2H_VERSION_CONF && len >= 3) {
 +		LOG("t=%u ms: *** HTT VERSION_CONF %u.%u ***", g_ms, p[2], p[1]);
 +		if (htt_state == 1) {

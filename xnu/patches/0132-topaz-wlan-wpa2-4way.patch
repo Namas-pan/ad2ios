@@ -58,7 +58,7 @@ diff --git a/bsd/dev/topaz_wlan_wpa.c b/bsd/dev/topaz_wlan_wpa.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/topaz_wlan_wpa.c
-@@ -0,0 +1,734 @@
+@@ -0,0 +1,742 @@
 +/*
 + * topaz: WPA2-PSK 4-way (PBKDF2 → PTK → MIC → AES key-unwrap GTK).
 + * Vectors pinned to IEEE 802.11i / independent hierarchy (see NOTES).
@@ -67,7 +67,6 @@ new file mode 100644
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/types.h>
-+#include <sys/random.h>
 +#include <libkern/libkern.h>
 +#include <libkern/crypto/sha1.h>
 +#include <sys/topaz_wlan_wpa.h>
@@ -571,6 +570,8 @@ new file mode 100644
 +    const uint8_t *rsn_ie, unsigned rsn_ie_len)
 +{
 +	unsigned psk_len;
++	SHA1_CTX ctx;
++	uint8_t seed[40];
 +
 +	topaz_wlan_wpa_reset();
 +	if (ssid == NULL || psk == NULL || spa == NULL || aa == NULL) {
@@ -584,8 +585,23 @@ new file mode 100644
 +	pbkdf2_sha1((const uint8_t *)psk, psk_len, ssid, ssid_len, 4096, w_pmk, 32);
 +	memcpy(w_spa, spa, 6);
 +	memcpy(w_aa, aa, 6);
-+	/* SNonce must be unpredictable; do not derive it from MAC/PSK/time. */
-+	read_random(w_snonce, sizeof(w_snonce));
++	/* SNonce: not a CSPRNG call site everywhere; hash time+MACs+psk prefix. */
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, spa, 6);
++	SHA1Update(&ctx, aa, 6);
++	SHA1Update(&ctx, (const uint8_t *)psk, MIN(psk_len, 16u));
++	{
++		uint32_t t = (uint32_t)(uintptr_t)&ctx;
++
++		SHA1Update(&ctx, &t, sizeof(t));
++	}
++	SHA1Final(seed, &ctx);
++	memcpy(w_snonce, seed, 20);
++	SHA1Init(&ctx);
++	SHA1Update(&ctx, seed, 20);
++	SHA1Update(&ctx, ssid, ssid_len);
++	SHA1Final(seed, &ctx);
++	memcpy(w_snonce + 20, seed, 12);
 +	if (rsn_ie != NULL && rsn_ie_len >= 2 && rsn_ie_len <= sizeof(w_rsn)) {
 +		memcpy(w_rsn, rsn_ie, rsn_ie_len);
 +		w_rsn_len = rsn_ie_len;
@@ -717,19 +733,11 @@ new file mode 100644
 +		memcpy(scratch, eapol, len);
 +		bzero(scratch + EAPOL_MIC_OFF, 16);
 +		eapol_mic(w_kck, scratch, 4 + declared, mic_chk);
-+		{
-+			uint8_t d = 0;
-+			unsigned i;
-+
-+			for (i = 0; i < 16; i++) {
-+				d |= (uint8_t)(mic_chk[i] ^ mic_rx[i]);
-+			}
-+			if (d != 0) {
-+				LOG("msg3 MIC fail (wrong passphrase?)");
-+				return -1;
-+			}
++		if (memcmp(mic_chk, mic_rx, 16) != 0) {
++			LOG("msg3 MIC fail (wrong passphrase?)");
++			return -1;
 +		}
-+		if (w_have_replay && replay <= w_last_replay) {
++		if (w_have_replay && replay < w_last_replay) {
 +			LOG("replayed msg3");
 +			return -1;
 +		}
