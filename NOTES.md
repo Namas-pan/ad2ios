@@ -189,25 +189,38 @@ nothing at runtime. That is intentional until the IONetworkingFamily headers exi
 - **Deferred**: RTC `rtc_read_raw()` rollover consistency; it was reverted because changing 0127 broke 0128's context and skipped the entire WLAN chain.
 - **Still open / not verified**: no phone test. The TX completion layout is taken from the ath10k/WCN3990 HTT documentation, not confirmed on this firmware; configd/IO80211 integration and App Store-class networking remain out of scope.
 
-### State (observation from tree, 2026-10-20)
+### State (observation from tree + CI, 2026-10-22)
 
 - Target: Xiaomi **topaz/tapas**, Qualcomm **SM6225 khaje**, iPhone X userland **16.7.16 / 20H392**.
-- Kernel patches: sweet **0001–0079** + topaz **0080–0146** (latest: `0146-topaz-ionet-cpp-flags.patch`).
+- Kernel patches: sweet **0001–0079** + topaz **0080–0133**; `0133-topaz-wlan-all.patch` is the
+  generated consolidated WLAN patch (the hand-written `0133`–`0146` files are gone).
+- CI is **green** on `Namas-pan/ad2ios` `main` (runs `39721267356`, `39732135050`; the newer one
+  also runs the host unit tests) and uploads `xnu-kernel` + `xnu-buildtree` artifacts.
 - Documented as bootable to lock screen (~3 min) on 4× Gold (A73); Silver parked (no 16K granule).
-- In-tree and default-on unless boot-arg disables: FT5452 touch, PM6125 keys, SM5602/bq battery, Gold max cpufreq, MDP direct scanout, PM6125 RTC read+write.
-- WLAN: 0113–0126 bring-up; **0129–0143** stack; **0144–0146** IONetworkingFamily (`sweet_ionet` + `iokitcpp` + `.cpo` flags); **0145** `TopazWlan` is `IOEthernetController`. `tw0` still attaches unless `sweetwlanif=0`. Offline header check (below) did not find a missing KPI symbol in the previously suspected set. No IO80211 / configd confirmation / resolv apply.
-- Phone-side confirmation of input/battery/scanout/RTC/MEMFDT/WLAN is **not recorded here** (no device in this session). Prefer `SWEET TOUCH:`, `SWEET KEYS:`, `SWEET RTC:`, `SWEET WLAN:`, `assoc:`, `SWEET WLAN WPA:`, shim `MEMFDT`/`MEMSZ`.
+- In-tree and default-on unless a boot-arg disables it: FT5452 touch, PM6125 keys, SM5602/bq
+  battery, Gold max cpufreq, MDP direct scanout, PM6125 RTC read+write.
+- WLAN: `0113`–`0126` bring-up (QMI/HTT/TX), `0129`–`0132` the WPA2 4-way handshake, and the
+  consolidated `0133` carries `bsd/dev/topaz_wlan_if.c` (the `tw0` ifnet plus ARP/DHCP/IPv4
+  datapath), the sysctl PSK front end and the `TopazModem.cpp` glue. `tw0` is the only datapath;
+  `sweetwlanif=0` stops attaching it. **IONetworkingFamily is not built** (its sources need
+  headers this xnu does not ship), so the `IOEthernetController` personalities are inert strings.
+  No IO80211 / configd confirmation / resolv apply.
+- The WPA2 math is host-tested (`tools/wpa-unit`, 20 checks); **no radio path has been exercised**.
+- Phone-side confirmation of input/battery/scanout/RTC/MEMFDT/WLAN is **not recorded here** (no
+  device in this session). Watch `SWEET TOUCH:`, `SWEET KEYS:`, `SWEET RTC:`, `SWEET WLAN:`,
+  `assoc:`, `SWEET WLAN WPA:`, shim `MEMFDT`/`MEMSZ`.
 - `sweethw=1` still means sweet SM7150 USB MMIO — **do not enable on topaz**.
-- `gh` 2.102.0 is logged in as `turgayasuk-sketch` with `workflow` scope. Public repo `https://github.com/turgayasuk-sketch/ios-topaz`, default branch `topaz`. CI **39378826721** PASSED in 7m13s (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39378826721) but dxb skipped patches **0127–0146**. First break: `0127` corrupt (`@@ -0,0 +1,252 @@` had 203 lines). `0129` had an extra context line after `@@ -39,6 +39,7 @@`. Hunk counts through `0146` were recounted after CI **39379923401** (cancelled) still rejected `0127` (`@@` fragment at line 244) and `0130` (line 47). Those headers now include the extra context line, pushed as `39758d6`. CI **39380746344** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39380746344): `0127`–`0129` applied; `0130` skipped (`patch fragment without header` at line 680 — a blank line between hunks; `git apply` rejects that). The compile then died in `TopazModem.cpo` with `'sys/topaz_wlan.h' file not found` (iokit sees `EXPORT_HDRS`, and `0129` never added the header to `bsd/sys/Makefile` `XNU_ONLY_EXPORTS`). Fix: drop that blank line; export `topaz_wlan.h`. Local `git apply --check` on `0130` now gets past syntax (missing tree). The Makefile hunk applies on xnu-8796.141.3 `bsd/sys/Makefile`. Pushed as `ff4a1ff`. CI **39382060692** FAILED (https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39382060692): `0130` and `0131` applied; `0132` skipped (`TopazModem.cpp:4888`). Compile error in `TopazModem.cpo`: `a_begin` / `a_arm` undeclared. Cause: `0131`'s hunk `@@ -486,100 +520,29 @@` deleted the `0130` helpers (`a_teardown`, `a_fail`, `a_arm`, `a_start_auth`, `a_start_assoc`, `a_begin`) instead of keeping them. Those lines are context again, and `a_teardown` now sets `a_ptk = false` (the line `0132` already expects). Local `git apply --check` on `0131` gets past syntax. Pushed as `49a1c20`. CI **39383167699** is in progress: https://github.com/turgayasuk-sketch/ios-topaz/actions/runs/39383167699. No `xnu/out-*` downloaded.
 
 ### Next concrete action
 
-1. CI: when run `39383167699` finishes, read remaining skips and the first compiler diagnostic. Keep repairing until `0146` compiles (`IONetworkController.cpo` / `TopazWlan.cpo`, no skip of `0127`–`0146`). Run `39378826721` did not build IONetworkingFamily.
-2. Phone (after a green kernel): `sweetwlanif=0 modem=1 wifi=1`, join, confirm ioreg `IOEthernetInterface` link up when authorized and traffic on that ifnet (not `tw0`). IO80211 still closed-source.
+1. Device: boot the CI `xnu-kernel` artifact, capture serial, confirm the lock screen, then watch
+   `SWEET WLAN:`/`assoc:` lines and whether `tw0` obtains a DHCP lease (`ifconfig tw0`).
+2. Software-only (no device needed): extend `tools/wpa-unit` coverage and re-read the radio path —
+   the HTT TX-completion layout comes from the ath10k/WCN3990 docs, not from this firmware.
 
-### Docs sync (2026-10-20)
+### Docs sync (2026-10-22)
 
-- README updated through patch 0146.
+- `README.md` and this file describe the consolidated `0133`; patch `0146` no longer exists.
 
 ### Shim dynamic highmem (2026-10-20)
 
